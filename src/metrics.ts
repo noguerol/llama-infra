@@ -33,18 +33,22 @@ function isPrometheusFormat(text: string): boolean {
 
 function parsePrometheusMetrics(text: string): Map<string, number> {
 	const metrics = new Map<string, number>();
+	const strip = (name: string) => name.replace(/^(?:llamacpp|vllm):/, "");
 	for (const line of text.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed || trimmed.startsWith("#")) continue;
 		const withLabels = trimmed.match(/^([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{[^}]*\}\s+([\d.eE+-]+)/);
 		if (withLabels) {
 			const value = parseFloat(withLabels[2]);
-			if (!isNaN(value)) metrics.set(withLabels[1], (metrics.get(withLabels[1]) ?? 0) + value);
+			if (!isNaN(value)) {
+				const name = strip(withLabels[1]);
+				metrics.set(name, (metrics.get(name) ?? 0) + value);
+			}
 			continue;
 		}
 		const parts = trimmed.split(/\s+/);
 		if (parts.length >= 2) {
-			const name = parts[0].replace(/^llamacpp:/, "");
+			const name = strip(parts[0]);
 			const value = parseFloat(parts[1]);
 			if (!isNaN(value)) metrics.set(name, (metrics.get(name) ?? 0) + value);
 		}
@@ -82,12 +86,12 @@ function toServerState(
 	prev: { raw: Map<string, number> } | undefined,
 ): ServerMetricsState {
 	const promptNow = counterValue(raw, ["prompt_tokens_total"]);
-	const genNow = counterValue(raw, ["predicted_tokens_total", "tokens_predicted_total"]);
+	const genNow = counterValue(raw, ["predicted_tokens_total", "tokens_predicted_total", "generation_tokens_total"]);
 	let promptTps: number | undefined;
 	let genTps: number | undefined;
 	if (prev && deltaSec > 0) {
 		const promptPrev = counterValue(prev.raw, ["prompt_tokens_total"]);
-		const genPrev = counterValue(prev.raw, ["predicted_tokens_total", "tokens_predicted_total"]);
+		const genPrev = counterValue(prev.raw, ["predicted_tokens_total", "tokens_predicted_total", "generation_tokens_total"]);
 		if (promptNow !== undefined && promptPrev !== undefined && promptNow > promptPrev)
 			promptTps = (promptNow - promptPrev) / deltaSec;
 		if (genNow !== undefined && genPrev !== undefined && genNow > genPrev)
@@ -97,10 +101,22 @@ function toServerState(
 	if (promptTps === undefined) promptTps = raw.get("prompt_tokens_seconds");
 	if (genTps === undefined) genTps = raw.get("predicted_tokens_seconds") ?? raw.get("tokens_predicted_seconds");
 	const processing = Math.round(raw.get("requests_processing") ?? counterValue(raw, ["num_requests_running"]) ?? 0);
+	// vLLM-only extras: speculative-decoding acceptance and prefix-cache hit ratio.
+	// Both are lifetime counters, so their ratio is a running average.
+	const specAccepted = raw.get("spec_decode_num_accepted_tokens_total");
+	const specDraft = raw.get("spec_decode_num_draft_tokens_total");
+	const specAcceptRate =
+		specAccepted !== undefined && specDraft !== undefined && specDraft > 0 ? specAccepted / specDraft : undefined;
+	const prefixHits = raw.get("prefix_cache_hits_total");
+	const prefixQueries = raw.get("prefix_cache_queries_total");
+	const prefixCacheHitRate =
+		prefixHits !== undefined && prefixQueries !== undefined && prefixQueries > 0 ? prefixHits / prefixQueries : undefined;
 	return {
 		processing,
 		...(promptTps !== undefined && promptTps > 0 ? { promptTps } : {}),
 		...(genTps !== undefined && genTps > 0 ? { genTps } : {}),
+		...(specAcceptRate !== undefined && specAcceptRate > 0 ? { specAcceptRate } : {}),
+		...(prefixCacheHitRate !== undefined && prefixCacheHitRate > 0 ? { prefixCacheHitRate } : {}),
 	};
 }
 

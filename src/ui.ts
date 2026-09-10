@@ -17,6 +17,7 @@ import type {
 	ModelOptions,
 	PiModel,
 	ServerConfig,
+	ServerKind,
 	ThinkingBudgets,
 } from "./types.ts";
 import { fetchModelsFromEndpoint, scanLocalServers } from "./scan.ts";
@@ -75,12 +76,39 @@ function formatTokens(n: number): string {
 	return `${n}`;
 }
 
-function metadataBadges(m: ModelMetadata | undefined): string {
+type ServerKindLike = ServerKind | "auto" | "unknown";
+
+/** Tolerant icon + label per server kind; unknown/future kinds never crash. */
+const KIND_META: Record<ServerKindLike, { icon: string; label: string }> = {
+	llamacpp: { icon: "🦙", label: "llama.cpp" },
+	zinc: { icon: "⚡", label: "ZINC" },
+	lucebox: { icon: "💡", label: "lucebox" },
+	dwarfstar: { icon: "🕵️", label: "ds4" },
+	lmstudio: { icon: "🎛️", label: "LM Studio" },
+	vllm: { icon: "🅥", label: "vLLM" },
+	auto: { icon: "🔎", label: "auto" },
+	unknown: { icon: "❔", label: "unknown" },
+};
+
+/** Falls back to `❔ <raw>` for unrecognized kinds instead of throwing. */
+function serverKindLabel(kind: string | undefined): string {
+	const meta = kind ? (KIND_META as Record<string, { icon: string; label: string } | undefined>)[kind] : undefined;
+	if (!meta) return `❔ ${kind && kind.length > 0 ? kind : "unknown"}`;
+	return `${meta.icon} ${meta.label}`;
+}
+
+/** GGUF/llama.cpp-specific KV cache types are meaningless for vLLM. */
+function showsGgufKvCache(kind: string | undefined): boolean {
+	return kind !== "vllm";
+}
+
+function metadataBadges(m: ModelMetadata | undefined, kind?: string): string {
 	if (!m) return "";
 	const parts: string[] = [];
 	if (m.quant) parts.push(`🗜️ ${m.quant}`);
-	if (m.cacheK || m.cacheV) parts.push(`🧠 KV ${m.cacheK ?? "?"}/${m.cacheV ?? m.cacheK ?? "?"}`);
+	if (showsGgufKvCache(kind) && (m.cacheK || m.cacheV)) parts.push(`🧠 KV ${m.cacheK ?? "?"}/${m.cacheV ?? m.cacheK ?? "?"}`);
 	if (m.vision) parts.push("👁️ vision");
+	// vLLM does not publish a drafter, but a manual override may set one: always show it.
 	if (m.drafter) parts.push(`🚀 ${m.drafter}`);
 	return parts.length > 0 ? ` — ${parts.join(" · ")}` : "";
 }
@@ -142,12 +170,12 @@ export async function showStatus(ctx: ExtensionContext): Promise<void> {
 		}
 		const kinds = new Map<string, number>();
 		for (const e of okEps) for (const _m of e.models) kinds.set(e.server, (kinds.get(e.server) ?? 0) + 1);
-		const kindStr = [...kinds.entries()].map(([k, n]) => `${k} ×${n}`).join(", ");
+		const kindStr = [...kinds.entries()].map(([k, n]) => `${serverKindLabel(k)} ×${n}`).join(", ");
 		const models = okEps.reduce((a, e) => a + e.models.length, 0);
 		lines.push(`🟢 ${serverLabel(srv)} (${srv.host}) — ${models} model(s) [${kindStr}]`);
 		for (const e of okEps.sort((a, b) => a.port - b.port)) {
 			const mode = e.mode === "router" ? " · 🌐 router mode" : e.mode === "single" ? " · single" : "";
-			lines.push(`   • :${e.port} → ${e.models.length} model(s) · ${e.server}${mode} · ${e.latencyMs ?? "?"}ms`);
+			lines.push(`   • :${e.port} → ${e.models.length} model(s) · ${serverKindLabel(e.server)}${mode} · ${e.latencyMs ?? "?"}ms`);
 		}
 	}
 	if (shared.lastError) lines.push("", `⚠️ Last error: ${shared.lastError}`);
@@ -158,7 +186,7 @@ export async function showStatus(ctx: ExtensionContext): Promise<void> {
 export async function showModelList(ctx: ExtensionContext): Promise<void> {
 	const models = shared.lastModels;
 	if (models.length === 0) {
-		ctx.ui.notify("🦙 no models discovered — try /llamacpp-infra scan", "warning");
+		ctx.ui.notify("🦙 no models discovered — try /llama-infra scan", "warning");
 		return;
 	}
 	const epByBaseUrl = new Map<string, EndpointResult>();
@@ -175,16 +203,17 @@ export async function showModelList(ctx: ExtensionContext): Promise<void> {
 	const lines: string[] = [`🦙 ${models.length} discovered`, ""];
 	for (const m of models) {
 		const ep = epByBaseUrl.get(m.baseUrl);
-		const where = ep ? `${ep.label}:${ep.port} (${ep.server}${ep.mode === "router" ? ", router" : ""})` : m.baseUrl;
+		const where = ep ? `${ep.label}:${ep.port} (${serverKindLabel(ep.server)}${ep.mode === "router" ? ", router" : ""})` : m.baseUrl;
 		const meta = metaFor(m);
 		const md = metadataBadges({
 			quant: m.quant ?? meta?.quant,
 			cacheK: m.cacheK ?? meta?.cacheK,
 			cacheV: m.cacheV ?? meta?.cacheV,
-			vision: m.input.includes("image") || meta?.vision,
+			// Manual `vision` overrides (e.g. vLLM) land in metadata; local mmproj detection is the fallback.
+			vision: meta?.vision ?? m.input.includes("image"),
 			drafter: m.drafter ?? meta?.drafter,
 			routerStatus: m.routerStatus ?? meta?.routerStatus,
-		});
+		}, ep?.server);
 		const ctxWin = formatCtx(m.contextWindow);
 		const status = m.routerStatus && m.routerStatus !== "loaded" ? ` · [${m.routerStatus}]` : "";
 		lines.push(`   • ${m.name}`, `     ${m.id} — ${where}${md} · ctx ${ctxWin || "?"}${status}`);
@@ -195,14 +224,14 @@ export async function showModelList(ctx: ExtensionContext): Promise<void> {
 export function showHelp(ctx: ExtensionContext): void {
 	ctx.ui.notify(
 		[
-			"🦙 llama.cpp-infra — llama.cpp & variants (ZINC, ds4, lucebox, LM Studio)",
+			"🦙 llama-infra — llama.cpp & variants (ZINC, ds4, lucebox, LM Studio, vLLM)",
 			"",
-			"  /llamacpp-infra            → status",
-			"  /llamacpp-infra config     → ⚙️ settings",
-			"  /llamacpp-infra scan       → rescan",
-			"  /llamacpp-infra status     → per-endpoint report",
-			"  /llamacpp-infra list       → models with quant/vision/drafter",
-			"  /llamacpp-infra metrics    → toggle live speed & metrics in the footer",
+			"  /llama-infra            → status",
+			"  /llama-infra config     → ⚙️ settings",
+			"  /llama-infra scan       → rescan",
+			"  /llama-infra status     → per-endpoint report",
+			"  /llama-infra list       → models with quant/vision/drafter",
+			"  /llama-infra metrics    → toggle live speed & metrics in the footer",
 			"  (footer: ⚡ prefill + 🔥 generation speed of the active model, shown in",
 			"   the status line; when pi is idle it also mirrors other clients from /metrics)",
 			"",
@@ -267,10 +296,10 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 			case "about":
 				ctx.ui.notify(
 					[
-						"🦙 llama.cpp-infra",
+						"🦙 llama-infra",
 						"",
-						"Discovers models served by llama.cpp, ZINC, DwarfStar (ds4), lucebox",
-						"and LM Studio on any number of machines, and registers them into",
+						"Discovers models served by llama.cpp, ZINC, DwarfStar (ds4), lucebox,",
+						"LM Studio and vLLM on any number of machines, and registers them into",
 						"pi's native /model list. Per-model metadata, thinking budgets,",
 						"live metrics, header warmup. See README for details.",
 						"",
@@ -429,7 +458,7 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				break;
 			}
 			case "test": {
-				ctx.ui.setStatus("llamacpp-infra", "🧪 testing…");
+				ctx.ui.setStatus("llama-infra", "🧪 testing…");
 				const localServers = config.settings.detectVision ? scanLocalServers() : new Map();
 				const results = await Promise.all(
 					srv.ports.map((port) => fetchModelsFromEndpoint(srv, port, config.settings, localServers)),
@@ -441,7 +470,7 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				for (const r of results.sort((a, b) => a.port - b.port)) {
 					if (r.ok) {
 						const mode = r.mode === "router" ? " · router" : "";
-						lines.push(`✅ :${r.port} — ${r.models.length} model(s) · ${r.server}${mode} · ${r.latencyMs ?? "?"}ms`);
+						lines.push(`✅ :${r.port} — ${r.models.length} model(s) · ${serverKindLabel(r.server)}${mode} · ${r.latencyMs ?? "?"}ms`);
 					} else if (r.loading) {
 						lines.push(`⏳ :${r.port} — loading model…`);
 					} else {
@@ -544,7 +573,7 @@ async function showThinkingBudgetsMenu(ctx: ExtensionContext, deps: UiDeps): Pro
 		if (items.length === 0) {
 			const info = await ctx.ui.confirm(
 				"🧠 Thinking budgets",
-				"No models discovered yet. Run /llamacpp-infra scan first, then come back. Open help?",
+				"No models discovered yet. Run /llama-infra scan first, then come back. Open help?",
 			);
 			if (info) showHelp(ctx);
 			return;
@@ -945,7 +974,7 @@ export async function testConnectivity(ctx: ExtensionContext): Promise<void> {
 		ctx.ui.notify("🧪 No enabled servers to test", "warning");
 		return;
 	}
-	ctx.ui.setStatus("llamacpp-infra", "🧪 testing…");
+	ctx.ui.setStatus("llama-infra", "🧪 testing…");
 	const localServers = config.settings.detectVision ? scanLocalServers() : new Map();
 	const all: EndpointResult[] = [];
 	for (const srv of enabled) {
@@ -960,11 +989,11 @@ export async function testConnectivity(ctx: ExtensionContext): Promise<void> {
 		const up = eps.filter((e) => e.ok).length;
 		lines.push(`${up === eps.length ? "🟢" : up > 0 ? "🟡" : "🔴"} ${serverLabel(srv)} (${srv.host}) — ${up}/${eps.length}`);
 		for (const e of eps) {
-			if (e.ok) lines.push(`   ✅ :${e.port} — ${e.models.length} model(s) · ${e.server}${e.mode === "router" ? " (router)" : ""} · ${e.latencyMs ?? "?"}ms`);
+			if (e.ok) lines.push(`   ✅ :${e.port} — ${e.models.length} model(s) · ${serverKindLabel(e.server)}${e.mode === "router" ? " (router)" : ""} · ${e.latencyMs ?? "?"}ms`);
 			else if (e.loading) lines.push(`   ⏳ :${e.port} — loading model…`);
 			else lines.push(`   ❌ :${e.port} — ${e.error?.slice(0, 70) ?? "unreachable"}`);
 		}
 	}
 	ctx.ui.notify(lines.join("\n"), "info");
-	ctx.ui.setStatus("llamacpp-infra", undefined);
+	ctx.ui.setStatus("llama-infra", undefined);
 }

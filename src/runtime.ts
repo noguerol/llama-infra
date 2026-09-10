@@ -124,7 +124,7 @@ export function createLongTimeoutOpenAICompletionsStream(model: any, context: an
 					role: "assistant",
 					content: [],
 					api: model?.api ?? "openai-completions",
-					provider: model?.provider ?? "llamacpp-infra",
+					provider: model?.provider ?? "llama-infra",
 					model: model?.id ?? "unknown",
 					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 					stopReason: "error",

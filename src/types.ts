@@ -1,4 +1,4 @@
-// Shared type definitions for llamacpp-infra (type-only; erased at runtime).
+// Shared type definitions for llama-infra (type-only; erased at runtime).
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -44,6 +44,10 @@ export interface ThinkingBudgets {
 /** Per-model options keyed by the registered model id. */
 export interface ModelOptions {
 	thinkingBudgets?: ThinkingBudgets;
+	/** Manual override to force vision detection (vLLM does not publish modalities in /v1/models). */
+	vision?: boolean;
+	/** Informative drafter/spec-decode label (vLLM does not publish it). */
+	drafter?: string;
 }
 
 export interface SettingsConfig {
@@ -114,6 +118,10 @@ export interface LlamaCppModel {
 	owned_by?: string;
 	display_name?: string;
 	path?: string;
+	/** vLLM: absolute checkpoint path (equivalent to `path` for extracting the quant tag). */
+	root?: string;
+	/** vLLM: maximum served context length. */
+	max_model_len?: number;
 	status?: {
 		value?: string;
 		args?: string[];
@@ -161,7 +169,7 @@ export interface ServerProps {
 	cache_type_v?: string;
 }
 
-export type ServerKind = "llamacpp" | "zinc" | "lucebox" | "dwarfstar" | "lmstudio";
+export type ServerKind = "llamacpp" | "zinc" | "lucebox" | "dwarfstar" | "lmstudio" | "vllm";
 export type ServerMode = "single" | "router" | "unknown";
 
 export interface ModelMetadata {
@@ -251,6 +259,10 @@ export interface ServerMetricsState {
 	promptTps?: number;
 	/** Generation rate in tokens/s over the last poll, if measurable. */
 	genTps?: number;
+	/** Speculative-decoding acceptance ratio (vLLM `spec_decode_*`), 0..1. */
+	specAcceptRate?: number;
+	/** Prefix-cache hit ratio (vLLM `prefix_cache_*`), 0..1. */
+	prefixCacheHitRate?: number;
 }
 
 export type ThemeFg = (color: any, text: string) => string;

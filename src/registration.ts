@@ -99,6 +99,27 @@ function toPiModel(
 		};
 	}
 
+	// vLLM / SGLang / TGI: OpenAI-compatible, context in max_model_len, no
+	// meta.n_ctx, no GGUF KV-cache, thinking driven by the chat template.
+	if (kind === "vllm") {
+		const displayName = cleanModelName(rawId);
+		const contextWindow =
+			model.max_model_len ?? model.context_window ?? model.context_length ?? 32768;
+		// vLLM serves one model per process (no router/status/slots), and
+		// cacheK/cacheV are llama.cpp/GGUF-specific.
+		const { routerStatus: _routerStatus, cacheK: _cacheK, cacheV: _cacheV, ...commonVllm } = common;
+		return {
+			...commonVllm,
+			id: `${displayName}${machineTag}`,
+			serverModelId: rawId,
+			name: `${displayName}${badgeSuffix(modelMeta, settings.showBadgesInNames)}`,
+			reasoning: true,
+			contextWindow,
+			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
+			compat: makeCompat(kind),
+		};
+	}
+
 	// ZINC / llama.cpp / dwarfstar.
 	const cleanName = cleanModelName(rawId);
 	const nameSource = model.path ?? rawId;
@@ -109,7 +130,8 @@ function toPiModel(
 	const displayName = nameMapName ? cleanModelName(nameMapName) : baseName2;
 
 	const contextWindow =
-		model.meta?.n_ctx ?? model.meta?.n_ctx_train ?? model.context_window ?? model.context_length ?? 32768;
+		model.meta?.n_ctx ?? model.meta?.n_ctx_train ?? model.max_model_len ??
+		model.context_window ?? model.context_length ?? 32768;
 
 	const isLlamaFamily = kind === "llamacpp";
 
@@ -235,7 +257,7 @@ export function buildAndRegisterProvider(
 	}
 
 	pi.registerProvider(PROVIDER_NAME, {
-		name: `🦙 llama.cpp-infra (${scan.totalModels} on ${scan.serversUp}/${scan.serversTotal} servers)`,
+		name: `🦙 llama-infra (${scan.totalModels} on ${scan.serversUp}/${scan.serversTotal} servers)`,
 		baseUrl: defaultBaseUrl,
 		apiKey: defaultApiKey,
 		api: "openai-completions",

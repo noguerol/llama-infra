@@ -173,6 +173,13 @@ export function createSpeedTracker(deps: SpeedDeps) {
 					if (server.genTps !== undefined && server.genTps > 0) {
 						parts.push(f(rateColor(server.genTps, "gen"), `🔥 ${formatRate(server.genTps)} t/s`));
 					}
+					// vLLM extras: drafter acceptance + prefix-cache reuse (lifetime ratios).
+					if (server.specAcceptRate !== undefined && server.specAcceptRate > 0) {
+						parts.push(f("muted", `🎯 ${Math.round(server.specAcceptRate * 100)}%`));
+					}
+					if (server.prefixCacheHitRate !== undefined && server.prefixCacheHitRate > 0) {
+						parts.push(f("muted", `♻️ ${Math.round(server.prefixCacheHitRate * 100)}%`));
+					}
 				} else {
 					parts.push(f("muted", "⏸"));
 				}

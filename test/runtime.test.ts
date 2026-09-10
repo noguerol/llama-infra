@@ -1,4 +1,4 @@
-// Standalone behavior test for llamacpp-infra runtime request defaults.
+// Standalone behavior test for llama-infra runtime request defaults.
 // Run: node --experimental-strip-types test/runtime.test.ts
 
 import { DEFAULT_PROVIDER_TIMEOUT_MS } from "../src/core.ts";

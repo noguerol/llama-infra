@@ -33,9 +33,9 @@ console.log("cost.ts: profile resolution");
 		{ id: "local", host: "127.0.0.1", label: "Local", ports: [8080, 8081], enabled: true, costProfile: { kW: 0.15, ratePerKwh: 0.21, label: "bruma" } },
 		{ id: "tower", host: "bruma", label: "Bruma", ports: [8081], enabled: true },
 	];
-	check("serverId match → profile", resolveCostProfile({ id: "llamacpp-infra/qwen", endpoint: { serverId: "local" } }, servers)?.kW === 0.15);
+	check("serverId match → profile", resolveCostProfile({ id: "llama-infra/qwen", endpoint: { serverId: "local" } }, servers)?.kW === 0.15);
 	check("host fallback hits local for 127.0.0.1", resolveCostProfile({ id: "x", endpoint: { host: "127.0.0.1" } }, servers)?.label === "bruma");
-	check("no profile server → null", resolveCostProfile({ id: "llamacpp-infra/ling", endpoint: { serverId: "tower" } }, servers) === null);
+	check("no profile server → null", resolveCostProfile({ id: "llama-infra/ling", endpoint: { serverId: "tower" } }, servers) === null);
 	check("no endpoint + no pattern → null", resolveCostProfile({ id: "deepseek/x" }, servers) === null);
 }
 
@@ -59,13 +59,13 @@ console.log("cost-tracker: lifecycle");
 	const tracker = createCostTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 		currency: () => "eur" as const,
 		profileFor: () => profile,
 	});
 	const ctx = {
-		model: { provider: "llamacpp-infra", id: "m1" },
+		model: { provider: "llama-infra", id: "m1" },
 		ui: { setStatus: (_k: string, t: string | undefined) => { statuses.length = 0; if (t !== undefined) statuses.push(t); } },
 	};
 

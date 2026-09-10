@@ -4,7 +4,7 @@
 
 import * as http from "node:http";
 import { readFileSync, readdirSync } from "node:fs";
-import { baseName, isLocalHost, serverLabel, shared } from "./core.ts";
+import { baseName, compactIdFor, isLocalHost, modelOptions, serverLabel, shared } from "./core.ts";
 import type {
 	EndpointResult,
 	HttpResult,
@@ -14,6 +14,7 @@ import type {
 	LmStudioModelsResponse,
 	LocalServerInfo,
 	ModelMetadata,
+	ModelOptions,
 	ParsedServerArgs,
 	ScanResult,
 	ServerConfig,
@@ -69,6 +70,27 @@ export function parseServerArgs(tokens: string[]): ParsedServerArgs {
 }
 
 // ── Local /proc scan (loopback only) ───────────────────────────────────────
+/** `--port N` / `--port=N`; undefined when absent or unparsable. */
+function portFromArgs(args: string[]): number | undefined {
+	const i = args.indexOf("--port");
+	if (i >= 0) {
+		const port = parseInt(args[i + 1] ?? "", 10);
+		if (!Number.isNaN(port)) return port;
+	}
+	for (const arg of args) {
+		if (!arg.startsWith("--port=")) continue;
+		const port = parseInt(arg.slice("--port=".length), 10);
+		if (!Number.isNaN(port)) return port;
+	}
+	return undefined;
+}
+
+/** vLLM/ROCm engines run as `python -m vllm…`, `VLLM::EngineCore` or `ornith…`. */
+function looksLikeVllmProcess(args: string[]): boolean {
+	const joined = args.join("\0").toLowerCase();
+	return joined.includes("vllm") || joined.includes("ornith");
+}
+
 export function scanLocalServers(): Map<number, LocalServerInfo> {
 	const found = new Map<number, LocalServerInfo>();
 	let pids: string[] = [];
@@ -82,11 +104,12 @@ export function scanLocalServers(): Map<number, LocalServerInfo> {
 		try {
 			const args = readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").filter(Boolean);
 			const bin = (args[0] ?? "").split("/").pop() ?? "";
-			if (!bin.startsWith("llama-server")) continue;
-			const i = args.indexOf("--port");
-			const port = i >= 0 ? parseInt(args[i + 1], 10) : NaN;
-			if (isNaN(port)) continue;
-			const parsed = parseServerArgs(args);
+			const isLlama = bin.startsWith("llama-server");
+			if (!isLlama && !looksLikeVllmProcess(args)) continue;
+			const port = portFromArgs(args);
+			if (port === undefined) continue;
+			// Python/vLLM engines expose no GGUF flags, so only the port hint applies.
+			const parsed = isLlama ? parseServerArgs(args) : {};
 			found.set(port, { port, ...parsed });
 		} catch {
 			// process vanished between readdir and read — ignore
@@ -107,7 +130,7 @@ function httpRequest(
 		const parsed = new URL(url);
 		const headers: http.OutgoingHttpHeaders = {
 			Accept: "application/json, text/plain",
-			"User-Agent": "pi-llamacpp-infra/1.0",
+			"User-Agent": "pi-llama-infra/1.0",
 		};
 		if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 		if (body) {
@@ -293,6 +316,8 @@ export async function detectServerKind(
 	if (models.some((m) => String(m.owned_by ?? "").toLowerCase().includes("lmstudio"))) return "lmstudio";
 	if (lmStudioCatalog && lmStudioCatalog.length > 0) return "lmstudio";
 	if (models.some((m) => m.lmStudio)) return "lmstudio";
+	// vLLM exposes owned_by:"vllm" + max_model_len (no /props, no meta.n_ctx).
+	if (models.some((m) => String(m.owned_by ?? "").toLowerCase() === "vllm")) return "vllm";
 	if (models.length > 0) return "llamacpp";
 	return "unknown";
 }
@@ -342,16 +367,23 @@ export async function probeDs4Server(
 }
 
 // ── Per-model metadata ─────────────────────────────────────────────────────
+/** Resolve `modelOptions` by raw server id, falling back to its compact/registered id. */
+function resolveModelOptions(rawId: string): ModelOptions | undefined {
+	const options = modelOptions();
+	return options[rawId] ?? options[compactIdFor(rawId) ?? rawId];
+}
+
 export function buildModelMetadata(
 	rawId: string,
 	entry: LlamaCppModel,
 	props: ServerProps | undefined,
 	local: LocalServerInfo | undefined,
+	kind?: ServerKind | "unknown",
 ): ModelMetadata {
 	const meta: ModelMetadata = {};
 
-	// Quant: GGUF filename / router id / LM Studio metadata.
-	const sourcePath = entry.path ?? props?.model_path ?? rawId;
+	// Quant: GGUF filename / router id / vLLM `root` / LM Studio metadata.
+	const sourcePath = entry.path ?? entry.root ?? props?.model_path ?? rawId;
 	meta.quant = extractQuantTag(sourcePath) ?? lmStudioQuantName(entry.lmStudio)?.toUpperCase();
 
 	// Vision.
@@ -374,9 +406,16 @@ export function buildModelMetadata(
 	if (!meta.drafter && local?.draft) meta.drafter = local.draft;
 	else if (!meta.drafter && local?.hasDraft) meta.drafter = "draft model";
 
-	// KV cache quantization.
-	meta.cacheK = argsInfo?.cacheK ?? local?.cacheK ?? props?.cache_type_k?.toLowerCase();
-	meta.cacheV = argsInfo?.cacheV ?? local?.cacheV ?? props?.cache_type_v?.toLowerCase();
+	// Manual overrides win: vLLM publishes neither modalities nor drafter.
+	const override = resolveModelOptions(rawId);
+	if (override?.vision !== undefined) meta.vision = override.vision;
+	if (override?.drafter !== undefined) meta.drafter = override.drafter;
+
+	// KV cache quantization is GGUF/llama.cpp-specific (vLLM has no /props, no cache flags).
+	if (kind === "llamacpp" || props !== undefined) {
+		meta.cacheK = argsInfo?.cacheK ?? local?.cacheK ?? props?.cache_type_k?.toLowerCase();
+		meta.cacheV = argsInfo?.cacheV ?? local?.cacheV ?? props?.cache_type_v?.toLowerCase();
+	}
 
 	// Router / LM Studio load status.
 	if (entry.status?.value) meta.routerStatus = entry.status.value;
@@ -448,7 +487,7 @@ export async function fetchModelsFromEndpoint(
 			if (mode === "router" && !model.architecture?.input_modalities && model.status?.value === "loaded") {
 				modelProps = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey, rawId)) ?? undefined;
 			}
-			ep.meta.set(rawId, buildModelMetadata(rawId, model, modelProps, local));
+			ep.meta.set(rawId, buildModelMetadata(rawId, model, modelProps, local, kind));
 		}
 
 		ep.server = kind;

@@ -1,7 +1,7 @@
 {
-  "name": "pi-llamacpp-infra",
-  "version": "1.3.1",
-  "description": "Discovery, metrics and control of llama.cpp-family servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio): scan machines (localhost, LAN, Tailscale), register models, live metrics, per-model thinking budgets, vision detection, native config UI.",
+  "name": "pi-llama-infra",
+  "version": "1.4.0",
+  "description": "Discovery, metrics and control of llama.cpp-family servers and vLLM/SGLang/TGI OpenAI-compatible servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio, vLLM, SGLang, TGI): scan machines (localhost, LAN, Tailscale), register models, live metrics, per-model thinking budgets, vision detection, native config UI.",
   "keywords": [
     "pi-package",
     "llamacpp",
@@ -13,23 +13,27 @@
     "vision",
     "thinking",
     "lm-studio",
-    "lmstudio"
+    "lmstudio",
+    "vllm",
+    "sglang",
+    "tgi",
+    "rocm"
   ],
   "author": "llama-infra contributors <https://github.com/noguerol>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/noguerol/llamacpp-infra"
+    "url": "https://github.com/noguerol/llama-infra"
   },
-  "homepage": "https://github.com/noguerol/llamacpp-infra",
+  "homepage": "https://github.com/noguerol/llama-infra",
   "bugs": {
-    "url": "https://github.com/noguerol/llamacpp-infra/issues"
+    "url": "https://github.com/noguerol/llama-infra/issues"
   },
   "pi": {
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/noguerol/llamacpp-infra/main/docs/preview.jpeg"
+    "image": "https://raw.githubusercontent.com/noguerol/llama-infra/main/docs/preview.jpeg"
   },
   "files": [
     "src"

@@ -14,15 +14,19 @@ import type {
 } from "./types.ts";
 
 // ── Provider identity ───────────────────────────────────────────────────────
-export const PROVIDER_NAME = "llamacpp-infra";
-export const STATUS_KEY = "llamacpp-infra";
-export const CONFIG_FILE = "llamacpp-infra.json";
-export const MODELS_CACHE_FILE = "llamacpp-infra-models.json";
-export const LEGACY_CONFIG_FILE = "local-models.json";
-export const METRICS_STATUS_KEY = "llamacpp-infra-speed";
-export const COST_STATUS_KEY = "llamacpp-infra-cost";
+export const PROVIDER_NAME = "llama-infra";
+export const STATUS_KEY = "llama-infra";
+export const CONFIG_FILE = "llama-infra.json";
+export const MODELS_CACHE_FILE = "llama-infra-models.json";
+/** Old config/cache filenames, tried in order when the new-named file is absent. */
+export const LEGACY_CONFIG_FILES = ["llamacpp-infra.json", "local-models.json"];
+export const LEGACY_MODELS_CACHE_FILES = ["llamacpp-infra-models.json"];
+export const METRICS_STATUS_KEY = "llama-infra-speed";
+export const COST_STATUS_KEY = "llama-infra-cost";
 export const DEFAULT_API_KEY = "no-auth";
 export const THINKING_BUDGET_FIELD = "thinking_budget_tokens";
+/** vLLM's thinking-budget field (differs from llama.cpp's). */
+export const VLLM_THINKING_BUDGET_FIELD = "thinking_token_budget";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 20 * 60 * 1000;
 
@@ -58,9 +62,9 @@ export const DEFAULT_SERVERS: ServerConfig[] = [
 ];
 
 // ── Debug logging ──────────────────────────────────────────────────────────
-export const DEBUG = process.env.PI_LLAMACPP_INFRA_DEBUG === "1" || process.env.PI_LLAMACPP_INFRA_DEBUG === "true";
+export const DEBUG = process.env.PI_LLAMA_INFRA_DEBUG === "1" || process.env.PI_LLAMA_INFRA_DEBUG === "true";
 export function debugLog(...args: unknown[]): void {
-	if (DEBUG) console.debug(`[llamacpp-infra]`, ...args);
+	if (DEBUG) console.debug(`[llama-infra]`, ...args);
 }
 
 // ── Config persistence ─────────────────────────────────────────────────────
@@ -140,12 +144,13 @@ export function loadConfig(): InfraConfig {
 				modelOptions: raw.modelOptions ?? {},
 			};
 		} catch (err) {
-			console.error(`[llamacpp-infra] Config load error: ${err}`);
+			console.error(`[llama-infra] Config load error: ${err}`);
 		}
 		return defaults;
 	}
-	const legacyPath = join(getAgentDir(), LEGACY_CONFIG_FILE);
-	if (existsSync(legacyPath)) {
+	for (const legacyFile of LEGACY_CONFIG_FILES) {
+		const legacyPath = join(getAgentDir(), legacyFile);
+		if (!existsSync(legacyPath)) continue;
 		try {
 			const raw = JSON.parse(readFileSync(legacyPath, "utf-8")) as Partial<InfraConfig>;
 			const migrated: InfraConfig = {
@@ -158,7 +163,7 @@ export function loadConfig(): InfraConfig {
 			debugLog(`migrated legacy config from ${legacyPath}`);
 			return migrated;
 		} catch {
-			// fall through to defaults
+			// try the next legacy file, then fall through to defaults
 		}
 	}
 	return defaults;
@@ -171,7 +176,7 @@ export function saveConfig(config: InfraConfig): void {
 		writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), "utf-8");
 		debugLog(`config saved to ${getConfigPath()}`);
 	} catch (err) {
-		console.error(`[llamacpp-infra] Config save error: ${err}`);
+		console.error(`[llama-infra] Config save error: ${err}`);
 	}
 }
 
@@ -244,15 +249,19 @@ export function saveModelsCache(models: import("./types.ts").PiModel[]): void {
 		writeFileSync(getModelsCachePath(), JSON.stringify(file), "utf-8");
 		debugLog(`models cache saved (${models.length} model(s))`);
 	} catch (err) {
-		console.error(`[llamacpp-infra] Models cache save error: ${err instanceof Error ? err.message : String(err)}`);
+		console.error(`[llama-infra] Models cache save error: ${err instanceof Error ? err.message : String(err)}`);
 	}
 }
 
 /** Load models cached by a previous scan, or null when absent/corrupt/empty. */
 export function loadModelsCache(): import("./types.ts").PiModel[] | null {
 	try {
-		const path = getModelsCachePath();
-		if (!existsSync(path)) return null;
+		let path = getModelsCachePath();
+		if (!existsSync(path)) {
+			const legacy = LEGACY_MODELS_CACHE_FILES.map((f) => join(getAgentDir(), f)).find((p) => existsSync(p));
+			if (!legacy) return null;
+			path = legacy;
+		}
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Partial<ModelsCacheFile>;
 		if (raw?.version !== MODELS_CACHE_VERSION || !Array.isArray(raw.models) || raw.models.length === 0) return null;
 		return raw.models.map((c) => ({
@@ -301,18 +310,28 @@ export function applyCachedSharedState(models: import("./types.ts").PiModel[]): 
 
 // ── Compat profile ─────────────────────────────────────────────────────────
 export function supportsThinkingBudget(kind: ServerKind | "unknown" | "auto" | undefined): boolean {
-	return kind === "llamacpp" || kind === "lucebox";
+	return kind === "llamacpp" || kind === "lucebox" || kind === "vllm";
+}
+
+/** Top-level thinking-budget field per server family (undefined = unsupported). */
+export function thinkingBudgetField(
+	kind: ServerKind | "unknown" | "auto" | undefined,
+): string | undefined {
+	if (kind === "vllm") return VLLM_THINKING_BUDGET_FIELD;
+	if (kind === "llamacpp" || kind === "lucebox") return THINKING_BUDGET_FIELD;
+	return undefined;
 }
 
 export function makeCompat(kind: ServerKind | "unknown" | "auto"): CompatProfile {
 	const usageInStreaming = kind !== "zinc";
+	const thinkingField = thinkingBudgetField(kind);
 	return {
 		supportsDeveloperRole: false,
 		supportsReasoningEffort: false,
 		maxTokensField: "max_tokens" as const,
 		supportsUsageInStreaming: usageInStreaming,
 		supportsStrictMode: false,
-		...(supportsThinkingBudget(kind) ? { thinkingTokenBudgetField: THINKING_BUDGET_FIELD } : {}),
+		...(thinkingField ? { thinkingTokenBudgetField: thinkingField } : {}),
 	};
 }
 

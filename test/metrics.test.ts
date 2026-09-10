@@ -60,7 +60,7 @@ const baseUrl = `http://127.0.0.1:${port}/v1`;
 // ── Wire poller → tracker like index.ts does ──────────────────────────────
 const lines: string[] = [];
 const ctx: any = {
-	model: { provider: "llamacpp-infra", id: "m1", baseUrl },
+	model: { provider: "llama-infra", id: "m1", baseUrl },
 	ui: {
 		setStatus: (_key: string, text: string | undefined) => {
 			lines.length = 0;
@@ -73,7 +73,7 @@ const ctx: any = {
 const tracker = createSpeedTracker({
 	isActive: () => true,
 	hasUI: (c) => !!c?.ui,
-	isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+	isOurs: (c) => c?.model?.provider === "llama-infra",
 	enabled: () => true,
 });
 

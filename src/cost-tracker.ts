@@ -1,4 +1,4 @@
-// Energy-cost tracker: measures inference time of the active llamacpp-infra
+// Energy-cost tracker: measures inference time of the active llama-infra
 // model from pi's stream events and accumulates the electricity cost.
 //
 //   cost per request = (requestMs / 3_600_000) × kW × tariff

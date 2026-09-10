@@ -19,7 +19,7 @@ function makeCtx(ours: boolean) {
 	const lines: string[] = [];
 	const ctx: any = {
 		model: {
-			provider: ours ? "llamacpp-infra" : "anthropic",
+			provider: ours ? "llama-infra" : "anthropic",
 			id: "m1",
 			baseUrl: "http://127.0.0.1:8080/v1",
 		},
@@ -43,7 +43,7 @@ console.log("speed tracker: basic turn lifecycle");
 	const tracker = createSpeedTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 	});
 
@@ -84,7 +84,7 @@ console.log("speed tracker: foreign model");
 	const tracker = createSpeedTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 	});
 	tracker.start(ctx);
@@ -99,7 +99,7 @@ console.log("speed tracker: disabled widget");
 	const tracker = createSpeedTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => false,
 	});
 	tracker.start(ctx);
@@ -126,7 +126,7 @@ console.log("speed tracker: render throttle (no spam)");
 	const tracker = createSpeedTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 	});
 	tracker.onRequest(ctxCount, 0);
@@ -154,7 +154,7 @@ console.log("speed tracker: dedup (no redundant status updates)");
 	const tracker = createSpeedTracker({
 		isActive: () => true,
 		hasUI: (c) => !!c?.ui,
-		isOurs: (c) => c?.model?.provider === "llamacpp-infra",
+		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 	});
 	tracker.onRequest(ctxDup, 0); // "⚡…" → 1 update

@@ -8,7 +8,6 @@ import { homedir } from "node:os";
 import {
 	PROVIDER_NAME,
 	STATUS_KEY,
-	THINKING_BUDGET_FIELD,
 	applyCachedSharedState,
 	compactIdFor,
 	debugLog,
@@ -20,11 +19,33 @@ import {
 	saveConfig,
 	setActiveConfig,
 	shared,
-	supportsThinkingBudget,
+	thinkingBudgetField,
 } from "./core.ts";
 import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
 import { resolveCostProfile } from "./cost.ts";
 import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
+import type { ModelOptions } from "./types.ts";
+
+/**
+ * Resolve per-model config overrides for a raw server model id: accepts the raw
+ * id, its registered compact id, or a legacy "host:port/<raw id>" key (the
+ * legacy form registration.ts migrates forward). Reuses the shared compact-id
+ * map instead of duplicating it. Exported for scan.ts (vLLM cannot publish
+ * modalities/drafter overrides).
+ */
+export function modelOptionsFor(rawId: string): ModelOptions | undefined {
+	if (!rawId) return undefined;
+	const opts = modelOptions();
+	if (opts[rawId]) return opts[rawId];
+	const compact = compactIdFor(rawId);
+	if (compact && opts[compact]) return opts[compact];
+	// Legacy keys: "<host>:<port>/<raw id>" (see registration.ts migration).
+	const rawSuffix = `/${rawId.replace(/^\/+/, "")}`;
+	for (const key of Object.keys(opts)) {
+		if (key.endsWith(rawSuffix)) return opts[key];
+	}
+	return undefined;
+}
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
@@ -162,7 +183,7 @@ export default function (pi: ExtensionAPI) {
 			// not registered yet
 		}
 		pi.registerProvider(PROVIDER_NAME, {
-			name: "🦙 llama.cpp-infra (scanning…)",
+			name: "🦙 llama-infra (scanning…)",
 			baseUrl: `http://${first?.host ?? "127.0.0.1"}:${first?.ports[0] ?? 8080}/v1`,
 			apiKey: first?.apiKey || "no-auth",
 			api: "openai-completions",
@@ -174,7 +195,7 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Boot provider registration (synchronous, cache-first) ────────────
 	// Registers models from the last known scan IMMEDIATELY when a cache exists,
-	// so this process can resolve `--model llamacpp-infra/...` at startup without
+	// so this process can resolve `--model llama-infra/...` at startup without
 	// waiting for the async discovery re-scan (which refreshes right after).
 	// Falls back to the empty "scanning…" provider when there is no cache.
 	function registerBootProvider() {
@@ -193,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 			applyCachedSharedState(cached);
 			const bootSrv = config.servers.find((s) => s.id === cached[0].endpoint?.serverId);
 			pi.registerProvider(PROVIDER_NAME, {
-				name: `🦙 llama.cpp-infra (cached ${cached.length}, rescanning…)`,
+				name: `🦙 llama-infra (cached ${cached.length}, rescanning…)`,
 				baseUrl: cached[0].baseUrl,
 				apiKey: bootSrv?.apiKey || "no-auth",
 				api: "openai-completions",
@@ -451,15 +472,17 @@ export default function (pi: ExtensionAPI) {
 		if (!modelId) return undefined;
 		const compactKey = shared.compactModelIds.get(modelId) ?? modelId;
 		const baseUrl = shared.modelBaseUrls.get(compactKey);
-		if (!supportsThinkingBudget(shared.endpointKinds.get(baseUrl ?? "") as never)) return undefined;
+		const kind = shared.endpointKinds.get(baseUrl ?? "");
+		const field = thinkingBudgetField(kind as never);
+		if (!field) return undefined;
 		const budgets = modelOptions()[compactKey]?.thinkingBudgets;
 		if (!budgets) return undefined;
 		const level = normalizeLevel(ctx.thinkingLevel ?? currentThinkingLevel);
 		if (!level) return undefined;
 		const value = budgets[level];
 		if (typeof value !== "number") return undefined;
-		debugLog(`thinking budget for ${compactKey} [${level}] = ${value}`);
-		return { ...payload, [THINKING_BUDGET_FIELD]: value };
+		debugLog(`thinking budget for ${compactKey} [${level}] = ${value} → ${field}`);
+		return { ...payload, [field]: value };
 	});
 
 	// ── Hook 3: header warmup capture ─────────────────────────────────────
@@ -479,10 +502,10 @@ export default function (pi: ExtensionAPI) {
 		if (!config.settings.warmup) return undefined;
 		if (!warm) {
 			const m = await loadWarmer();
-			const status = new m.WarmupStatus("warmup-llamacpp-infra");
+			const status = new m.WarmupStatus("warmup-llama-infra");
 			const warmer = new m.PromptWarmer({
 				provider: PROVIDER_NAME,
-				cacheFile: join(homedir(), ".pi", "agent", "warmup-llamacpp-infra.json"),
+				cacheFile: join(homedir(), ".pi", "agent", "warmup-llama-infra.json"),
 				kindFor: (baseUrl) => shared.endpointKinds.get(baseUrl),
 				requestModelFor: (modelId) => rawIdFor(modelId) ?? modelId,
 				onEvent: (ev) => status.handle(ev),
@@ -529,8 +552,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	// ── Command ───────────────────────────────────────────────────────────
-	pi.registerCommand("llamacpp-infra", {
-		description: "🦙 llama.cpp-infra: scan, status, config, metrics for llama.cpp/ZINC/ds4/lucebox/LM Studio",
+	pi.registerCommand("llama-infra", {
+		description: "🦙 llama-infra: scan, status, config, metrics for llama.cpp/ZINC/ds4/lucebox/LM Studio/vLLM",
 		getArgumentCompletions: (prefix) =>
 			["config", "scan", "status", "list", "metrics", "help"]
 				.filter((s) => s.startsWith(prefix))
@@ -566,7 +589,7 @@ export default function (pi: ExtensionAPI) {
 					ui.showHelp(ctx);
 					break;
 				default:
-					ctx.ui.notify(`❓ unknown "${sub}". Try /llamacpp-infra help`, "warning");
+					ctx.ui.notify(`❓ unknown "${sub}". Try /llama-infra help`, "warning");
 			}
 		},
 	});
