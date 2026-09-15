@@ -2,13 +2,13 @@
 
 ![llama-infra banner](https://raw.githubusercontent.com/noguerol/llama-infra/main/docs/banner.jpeg)
 
-**llama-infra** turns pi into a first-class citizen of your local LLM infrastructure. It is built primarily around **llama.cpp** and its family (ZINC, DwarfStar/ds4, lucebox, LM Studio), and now also speaks the most popular OpenAI-compatible runtimes — **vLLM / SGLang / TGI**. It probes any number of machines — localhost, LAN or Tailscale — discovers every served model, registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
+**llama-infra** turns pi into a first-class citizen of your local LLM infrastructure. It is built primarily around **llama.cpp** and its family (ZINC, DwarfStar/ds4, lucebox, LM Studio), and now also speaks the most popular OpenAI-compatible runtimes — **vLLM / SGLang / TGI** — and the **halogen** engine. It probes any number of machines — localhost, LAN or Tailscale — discovers every served model, registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
 
 ---
 
 ## Supported Servers
 
-Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an OpenAI-compatible vLLM-family server:
+Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an OpenAI-compatible server (vLLM-family or halogen):
 
 | Server | Detection | Notes |
 |--------|-----------|-------|
@@ -18,6 +18,7 @@ Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an Open
 | **lucebox** | `GET /props` with `server.name: "luce-*"` | DeepSeek dflash server with rich metadata |
 | **LM Studio** | `GET /v1/models` + optional `/api/v1/models` metadata | Local OpenAI-compatible server backed by llama.cpp; default port `1234` |
 | **vLLM / SGLang / TGI** | `owned_by: "vllm"` in `GET /v1/models` | OpenAI-compatible runners; context from `max_model_len`; **no** `/props`, **no** `/slots`; thinking via `thinking_token_budget` |
+| **halogen** | `owned_by: "halogen"` in `GET /v1/models` with **no** `/props` | OpenAI-compatible engine; context read from `GET /health` (`slot_ctx` / `context`); metrics served in the `llamacpp:` namespace (see [halogen](#halogen)) |
 
 Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in providers for those.
 
@@ -34,6 +35,7 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
 - **LM Studio support** — uses LM Studio's OpenAI-compatible `/v1` API, enriches names/context/quant/vision from `/api/v1/models` (or legacy `/api/v0/models`), and avoids llama.cpp-only request fields
 - **vLLM / SGLang / TGI support** — auto-detects `owned_by: "vllm"`, reads the context window from `max_model_len`, normalizes the `vllm:` metrics namespace, and uses vLLM's own `thinking_token_budget` field (see [vLLM / SGLang / TGI](#vllm--sglang--tgi))
+- **halogen support** — auto-detects `owned_by: "halogen"` and pulls the real context window from `/health` (`slot_ctx` / `context`), with an 8 s probe floor and a sticky per-machine value, so pi never compacts at the 32k fallback on a 262k model (see [halogen](#halogen))
 - **ZINC workaround** — ZINC rejects non-empty model IDs; the payload hook rewrites the request and normalizes tool definitions automatically
 - **Vision detection** — scans `/proc` for local llama-server processes launched with `--mmproj` and marks those models as image-capable; also reads server-reported `modalities` / `input_modalities`
 - **Native configuration UI** — everything configurable through `/llama-infra config` with pi's native menus; no config file editing required
@@ -67,7 +69,7 @@ pi remove npm:pi-llama-infra
 
 > **Security:** pi packages run with full system access. Install only packages you trust and review the source.
 
-**Requirements:** a working pi installation and at least one supported server running somewhere accessible (localhost, LAN or Tailscale): a llama.cpp-family server, or an OpenAI-compatible vLLM/SGLang/TGI endpoint. LM Studio works when its local server is started (Developer tab or `lms server start`, usually on `http://localhost:1234/v1`).
+**Requirements:** a working pi installation and at least one supported server running somewhere accessible (localhost, LAN or Tailscale): a llama.cpp-family server, an OpenAI-compatible vLLM/SGLang/TGI endpoint, or a halogen server. LM Studio works when its local server is started (Developer tab or `lms server start`, usually on `http://localhost:1234/v1`).
 
 ## Quick Start
 
@@ -161,6 +163,51 @@ Per-level thinking budget for the registered vLLM model (injected as `thinking_t
   }
 }
 ```
+
+## halogen
+
+**halogen** is a proprietary OpenAI-compatible engine. It answers `GET /v1/models` like everyone else, but publishes **neither `/props` nor `meta.n_ctx`** — the context window lives only in `GET /health`. Without reading it, the registration chain falls back to 32,768 and pi compacts at ~33k on a model serving 262,144.
+
+**Detection** — a model with `owned_by: "halogen"`, no `/props` answer, and a reachable `/health` is picked up automatically, with no extra flags. halogen servers are registered into the llama.cpp family:
+
+```bash
+curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.owned_by)"'
+# halogen-qwen3.8-flash-next owned_by=halogen
+
+curl -s http://127.0.0.1:8081/health | jq '{context, slot_ctx, slots}'
+# { "context": 262144, "slot_ctx": 262144, "slots": 3 }
+```
+
+**Context grafting** — once per scan, llama-infra probes `/health` at the server root and grafts `slot_ctx` (preferred) or `context` onto every model as `meta.n_ctx` and `max_model_len`, never overwriting a value the server did publish.
+
+**Slow-health guard (8 s floor)** — `/health` pings the engine itself (`engine.probe_s`), so it can take seconds while a request is in flight or under memory pressure. The generic `discoveryTimeoutMs` (2 s by default) is too short for that: the health probe gets a floor of **8 s** regardless, so a busy engine never looks like a missing one.
+
+**Sticky context** — the last good context is remembered per `host:port`. If a later scan's `/health` probe stalls, llama-infra reuses the remembered value instead of regressing to the 32,768 fallback, so the registered `contextWindow` stays stable and pi's compaction stays predictable across scans.
+
+**What works out of the box** — halogen models are registered as llama.cpp-family:
+
+| Area | Behaviour |
+|---|---|
+| Context window | the real served context from `/health` (e.g. 262,144), not the fallback |
+| Compaction | driven by that real context |
+| Metrics | `/metrics` is served in the `llamacpp:` namespace → footer ⚡ prefill / 🔥 generation work unchanged |
+| Long generations | 32k output cap and the 20 minute timeout floor, same as llama.cpp |
+| Thinking budgets | injected under llama.cpp's field name `thinking_budget_tokens` (the family default) |
+
+> **Thinking budgets on halogen** — the engine publishes its own knobs as `reasoning_effort` and `max_thinking_tokens`, and its `/health` `supported` list is the authority on what a request may set. Whether it also maps llama.cpp's `thinking_budget_tokens` is **unverified**: treat per-level budgets on halogen as best-effort and check `/health` before relying on them.
+
+**Manual overrides** — halogen reports `vision.enabled`, `drafters_available` and `drafter_default` in `/health`, but llama-infra reads only the context from it today. Set the rest per model:
+
+```json
+{ "modelOptions": { "halogen-qwen3.8-flash-next": { "vision": true, "drafter": "mtp" } } }
+```
+
+**Known limitations**
+
+- Vision is not auto-detected — force `modelOptions[id].vision = true` (the server's own `/health` reports `vision.enabled`).
+- The 🚀 drafter badge stays empty unless set via `modelOptions[id].drafter`.
+- A halogen server that has never answered `/health` registers with the 32,768 fallback until the first successful probe (then the value sticks).
+- halogen takes images as `data:` URLs or bare base64 and refuses `http(s)` image URLs — a server-side contract, not a llama-infra setting.
 
 ## Commands
 
@@ -390,7 +437,7 @@ llama-infra/
     ├── index.ts         # Entrypoint: hooks, command, lifecycle. Statically imports core + types.
     ├── core.ts          # Config persistence, shared state, id helpers, compat profile (loaded at startup).
     ├── types.ts         # Shared interfaces (type-only; erased at runtime).
-    ├── scan.ts          # Discovery engine (lazy: HTTP probing, /props, LM Studio catalog, /proc, kind detection).
+    ├── scan.ts          # Discovery engine (lazy: HTTP probing, /props, halogen /health context graft, LM Studio catalog, /proc, kind detection).
     ├── registration.ts  # Scan → pi-model mapping + provider registration (lazy).
     ├── metrics.ts       # Server /metrics poller → ServerMetricsState (lazy; only if `metricsEnabled`).
     ├── speed.ts         # Client-side speed tracker + footer status line (lazy; only if `metricsEnabled`).
@@ -415,7 +462,7 @@ Zero external npm dependencies (only pi's bundled `@earendil-works/pi-coding-age
 
 Subsystems:
 
-- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio, vLLM)
+- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio, vLLM, halogen)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
 - **Speed & metrics subsystem** — client-side per-token speed measurement (prefill + moving-window generation), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration
