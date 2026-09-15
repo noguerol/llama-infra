@@ -350,6 +350,11 @@ export const shared = {
 	registeredCount: 0,
 	lastError: undefined as string | undefined,
 	rIncludeUnloaded: false,
+	/** Sticky halogen contexts (host:port -> positions). halogen learns the
+	 *  context from /health, which probes the engine and can stall for seconds
+	 *  under memory pressure; without sticky memory the context would flap to
+	 *  the 32768 fallback and pi would "compact" at 33k on a 262k model. */
+	halogenCtx: new Map<string, number>(),
 };
 
 export function setActiveConfig(c: InfraConfig | undefined): void {

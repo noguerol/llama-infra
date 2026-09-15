@@ -216,20 +216,31 @@ export async function applyHalogenHealth(
 	models: LlamaCppModel[],
 	timeoutMs: number,
 	apiKey?: string,
+	hostKey?: string,
 ): Promise<void> {
 	const rootUrl = baseUrl.replace(/\/v1\/?$/, "");
+	// /health probes the engine (seconds when busy); the generic 2 s discovery
+	// timeout is too short for it. Give this one a floor of 8 s.
+	const probeMs = Math.max(timeoutMs, 8000);
+	let ctx: number | undefined;
 	try {
-		const { status, body } = await httpGet(`${rootUrl}/health`, timeoutMs, apiKey);
-		if (status < 200 || status >= 300) return;
-		const h = JSON.parse(body) as { context?: number; slot_ctx?: number };
-		const ctx = h.slot_ctx ?? h.context;
-		if (typeof ctx !== "number" || ctx <= 0) return;
-		for (const m of models) {
-			m.meta = { ...(m.meta ?? {}), n_ctx: m.meta?.n_ctx ?? ctx };
-			m.max_model_len = m.max_model_len ?? ctx;
+		const { status, body } = await httpGet(`${rootUrl}/health`, probeMs, apiKey);
+		if (status >= 200 && status < 300) {
+			const h = JSON.parse(body) as { context?: number; slot_ctx?: number };
+			const c = h.slot_ctx ?? h.context;
+			if (typeof c === "number" && c > 0) ctx = c;
 		}
 	} catch {
-		// not reachable / not halogen shape — leave the fallback in place
+		// engine busy / stall: fall back to the sticky value below
+	}
+	if (hostKey) {
+		if (ctx !== undefined) shared.halogenCtx.set(hostKey, ctx);
+		else ctx = shared.halogenCtx.get(hostKey); // transient miss: do not regress to 32768
+	}
+	if (typeof ctx !== "number" || ctx <= 0) return;
+	for (const m of models) {
+		m.meta = { ...(m.meta ?? {}), n_ctx: m.meta?.n_ctx ?? ctx };
+		m.max_model_len = m.max_model_len ?? ctx;
 	}
 }
 
@@ -505,7 +516,7 @@ export async function fetchModelsFromEndpoint(
 
 		const kind = await detectServerKind(baseUrl, models, props, lmStudioCatalog);
 		if (kind === "llamacpp" && props === undefined && models.some((m) => String(m.owned_by ?? "").toLowerCase() === "halogen")) {
-			await applyHalogenHealth(baseUrl, models, settings.discoveryTimeoutMs, srv.apiKey);
+			await applyHalogenHealth(baseUrl, models, settings.discoveryTimeoutMs, srv.apiKey, `${srv.host}:${port}`);
 		}
 		if (kind === "lucebox") {
 			props = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey)) ?? props;
