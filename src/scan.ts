@@ -204,6 +204,35 @@ export function cleanModelName(rawId: string): string {
 }
 
 // ── /props + LM Studio catalog ─────────────────────────────────────────────
+/**
+ * halogen (owned_by:"halogen") is a proprietary OpenAI-compatible engine: it
+ * publishes neither /props nor meta.n_ctx in /v1/models — the context lives
+ * only in /health (context / slot_ctx). Without this the registration chain
+ * falls back to 32768 and pi compacts way too early. Probe /health once per
+ * scan and graft the numbers onto the model entries.
+ */
+export async function applyHalogenHealth(
+	baseUrl: string,
+	models: LlamaCppModel[],
+	timeoutMs: number,
+	apiKey?: string,
+): Promise<void> {
+	const rootUrl = baseUrl.replace(/\/v1\/?$/, "");
+	try {
+		const { status, body } = await httpGet(`${rootUrl}/health`, timeoutMs, apiKey);
+		if (status < 200 || status >= 300) return;
+		const h = JSON.parse(body) as { context?: number; slot_ctx?: number };
+		const ctx = h.slot_ctx ?? h.context;
+		if (typeof ctx !== "number" || ctx <= 0) return;
+		for (const m of models) {
+			m.meta = { ...(m.meta ?? {}), n_ctx: m.meta?.n_ctx ?? ctx };
+			m.max_model_len = m.max_model_len ?? ctx;
+		}
+	} catch {
+		// not reachable / not halogen shape — leave the fallback in place
+	}
+}
+
 export async function fetchServerProps(
 	baseUrl: string,
 	timeoutMs: number,
@@ -475,6 +504,9 @@ export async function fetchModelsFromEndpoint(
 		if (mode === "router") props = undefined;
 
 		const kind = await detectServerKind(baseUrl, models, props, lmStudioCatalog);
+		if (kind === "llamacpp" && props === undefined && models.some((m) => String(m.owned_by ?? "").toLowerCase() === "halogen")) {
+			await applyHalogenHealth(baseUrl, models, settings.discoveryTimeoutMs, srv.apiKey);
+		}
 		if (kind === "lucebox") {
 			props = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey)) ?? props;
 		}
