@@ -38,7 +38,7 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 - **halogen support** — auto-detects `owned_by: "halogen"` and pulls the real context window from `/health` (`slot_ctx` / `context`), with an 8 s probe floor and a sticky per-machine value, so pi never compacts at the 32k fallback on a 262k model (see [halogen](#halogen))
 - **ZINC workaround** — ZINC rejects non-empty model IDs; the payload hook rewrites the request and normalizes tool definitions automatically
 - **Vision detection** — scans `/proc` for local llama-server processes launched with `--mmproj` and marks those models as image-capable; also reads server-reported `modalities` / `input_modalities`
-- **Native configuration UI** — everything configurable through `/llama-infra config` with pi's native menus; no config file editing required
+- **Native configuration UI** — everything configurable through `/llama-infra config`; the discovery settings panel uses pi's own `/settings` component (`SettingsList`): one row per option with its value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search; no config file editing required
 - **Legacy migration** — auto-migrates an existing `~/.pi/agent/local-models.json` on first run
 
 ## Install
@@ -231,7 +231,8 @@ The main config menu branches into submenus:
 - **🧪 Test** — connectivity test of all configured servers
 - **🧠 Thinking budgets** — configure per-model thinking_budget_tokens per level
 - **📈 Metrics** — enable/disable footer metrics, server poll interval
-- **⚙️ Settings** — discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, header warmup
+- **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
+- **♻️ Reset settings** — restore all discovery settings to their defaults
 - **ℹ️ About** — extension info
 
 ### `/llama-infra list`

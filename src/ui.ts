@@ -1,5 +1,8 @@
 // UI / menus / status views. Lazy-loaded on command invocation.
 
+import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, SettingsList, type SettingItem, Text } from "@earendil-works/pi-tui";
+
 import {
 	DEFAULT_SETTINGS,
 	getConfigPath,
@@ -182,6 +185,82 @@ export async function showStatus(ctx: ExtensionContext): Promise<void> {
 	ctx.ui.notify(lines.join("\n"), "info");
 }
 
+// ── Native-style settings panel ────────────────────────────────────────────
+// Same component pi's own /settings uses (SettingsList from pi-tui): label +
+// current value per row, a description line under the list that explains the
+// highlighted option, "Enter/Space to change · Esc to cancel" footer hint.
+
+/**
+ * Open a native-style settings panel (the same SettingsList pi's /settings
+ * uses). Enter/Space cycles an item through its `values`; the description of
+ * the highlighted item shows as a hint line under the list. onChange persists
+ * via saveConfig; ids listed in onRerun also trigger a background rescan.
+ * Resolves when the user presses Esc; false when TUI mode is unavailable.
+ */
+async function settingsPanel(
+	ctx: ExtensionContext,
+	title: string,
+	items: SettingItem[],
+	handlers: {
+		onChange: (id: string, newValue: string) => void;
+		onRerun?: string[];
+	},
+): Promise<boolean> {
+	if (ctx.mode !== "tui") {
+		ctx.ui.notify("⚙️ the config UI requires TUI mode", "warning");
+		return false;
+	}
+	await ctx.ui.custom((_tui, theme, _kb, done: () => void) => {
+		const container = new Container();
+		container.addChild(new Text(theme.fg("accent", theme.bold(title)), 1, 0));
+		const list = new SettingsList(
+			items,
+			Math.min(items.length, 12),
+			getSettingsListTheme(),
+			(id, newValue) => {
+				handlers.onChange(id, newValue);
+				if (handlers.onRerun?.includes(id)) {
+					// Fire-and-forget: the panel keeps its focus; notifications land after.
+					void depsOf.rescan(ctx);
+				}
+			},
+			() => done(),
+			{ enableSearch: true },
+		);
+		container.addChild(list);
+		return {
+			render: (w: number) => container.render(w),
+			invalidate: () => container.invalidate(),
+			handleInput: (data: string) => list.handleInput(data),
+		};
+	});
+	return true;
+}
+
+let currentDeps: Pick<UiDeps, "rescan"> = { rescan: async () => {} };
+const depsOf = () => currentDeps;
+
+const SETTING_LABELS: Record<string, string> = {
+	discoveryTimeoutMs: "Discovery timeout",
+	pollIntervalMs: "Poll interval",
+	pollMaxMs: "Poll budget",
+	startupGraceMs: "Startup grace",
+	knownGoodFailLimit: "Known-good fail limit",
+	detectVision: "Vision detection",
+	prefixModelIds: "Prefix model IDs",
+	showBadgesInNames: "Badges in names",
+	includeUnloadedRouterModels: "Include unloaded models",
+	maxOutputTokens: "Max output tokens",
+	requestTimeoutMs: "Request timeout",
+	warmup: "Header warmup",
+};
+function settingLabel(id: string): string {
+	return SETTING_LABELS[id] ?? id;
+}
+
+const ON_OFF: [string, string] = ["true", "false"];
+const onOff = (b: boolean) => (b ? "true" : "false");
+
 // ── Model list ─────────────────────────────────────────────────────────────
 export async function showModelList(ctx: ExtensionContext): Promise<void> {
 	const models = shared.lastModels;
@@ -243,6 +322,7 @@ export function showHelp(ctx: ExtensionContext): void {
 
 // ── Config menu ────────────────────────────────────────────────────────────
 export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
+	currentDeps = deps;
 	const config = shared.activeConfig!;
 	for (;;) {
 		const budgetCount = Object.values(modelOptions()).filter((o) => o.thinkingBudgets).length;
@@ -262,7 +342,8 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 				label: `📈 Live speed & metrics: ${config.settings.metricsEnabled ? "ON" : "OFF"}`,
 				description: `per-token speed · server poll ${formatMs(config.settings.metricsPollMs)}`,
 			},
-			{ value: "settings", label: "⚙️ Discovery settings", description: "timeouts, polling, vision, badges…" },
+			{ value: "settings", label: "⚙️ Discovery settings", description: "timeouts, polling, vision, badges… (native panel)" },
+			{ value: "reset", label: "♻️ Reset settings", description: "restore all discovery settings to their defaults" },
 			{ value: "about", label: "ℹ️ About", description: "how this extension works" },
 			{ value: "close", label: "🚪 Close", description: "" },
 		]);
@@ -293,6 +374,16 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 			case "settings":
 				await showSettingsMenu(ctx, deps);
 				break;
+			case "reset": {
+				const ok = await ctx.ui.confirm("♻️ Reset settings", "Restore all discovery settings to their defaults?");
+				if (ok) {
+					config.settings = { ...DEFAULT_SETTINGS };
+					saveConfig(config);
+					ctx.ui.notify("♻️ Settings reset to defaults", "info");
+					await deps.rescan(ctx);
+				}
+				break;
+			}
 			case "about":
 				ctx.ui.notify(
 					[
@@ -768,203 +859,147 @@ async function showServerCostMenu(ctx: ExtensionContext, srv: ServerConfig, conf
 	}
 }
 
-// ── Settings menu ──────────────────────────────────────────────────────────
+// ── Settings menu (native pi /settings style: description hint per option) ──
 async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
-	const config = shared.activeConfig!;
-	for (;;) {
-		const s = config.settings;
-		const action = await selectFrom(ctx, "⚙️ Discovery settings", [
-			{
-				value: "timeout",
-				label: `⏱️ Discovery timeout: ${formatMs(s.discoveryTimeoutMs)}`,
-				description: "per-request timeout when probing endpoints",
-			},
-			{
-				value: "interval",
-				label: `🔁 Poll interval: ${formatMs(s.pollIntervalMs)}`,
-				description: "background re-poll while servers load",
-			},
-			{
-				value: "budget",
-				label: `⏳ Poll budget: ${formatMs(s.pollMaxMs)}`,
-				description: "max total time the background poller runs",
-			},
-			{
-				value: "grace",
-				label: `🌅 Startup grace: ${formatMs(s.startupGraceMs)}`,
-				description: "keep trying at startup while nothing has answered",
-			},
-			{
-				value: "faillimit",
-				label: `💀 Known-good fail limit: ${s.knownGoodFailLimit}`,
-				description: "consecutive failures before a live endpoint is dropped",
-			},
-			{
-				value: "vision",
-				label: `👁️ Vision detection: ${s.detectVision ? "ON" : "OFF"}`,
-				description: "/proc flags + server-reported modalities",
-			},
-			{
-				value: "prefix",
-				label: `🏷️ Prefix model IDs: ${s.prefixModelIds ? "ON" : "OFF"}`,
-				description: 'ids like "host:8081/model" avoid collisions',
-			},
-			{
-				value: "badges",
-				label: `🏷️ Name badges: ${s.showBadgesInNames ? "ON" : "OFF"}`,
-				description: "append 👁️🚀💤 badges to model names",
-			},
-			{
-				value: "unloaded",
-				label: `💤 Include unloaded router models: ${s.includeUnloadedRouterModels ? "ON" : "OFF"}`,
-				description: "router mode: list models not currently loaded",
-			},
-			{
-				value: "maxtokens",
-				label: `📏 Max output tokens: ${formatTokens(s.maxOutputTokens)}`,
-				description: "per-model ceiling for outgoing max_tokens requests",
-			},
-			{
-				value: "timeoutfloor",
-				label: `⏱️ Request timeout: ${formatMs(s.requestTimeoutMs)}`,
-				description: "lower bound on OpenAI-completions stream idle timeout",
-			},
-			{
-				value: "warmup",
-				label: `☕ Header warmup: ${s.warmup ? "ON" : "OFF"}`,
-				description: "pre-cache system prompt on llama.cpp-family servers",
-			},
-			{ value: "reset", label: "♻️ Reset all settings to defaults", description: "" },
-			{ value: "__back", label: "← Back", description: "" },
-		]);
-		if (action === undefined || action === "__back") return;
+	currentDeps = deps;
+	const s = shared.activeConfig!.settings;
+	const fmt = (arr: number[]) => arr.map((v) => formatMs(v));
 
-		const pickNumber = async (title: string, options: number[]): Promise<number | undefined> => {
-			return selectFrom(
-				ctx,
-				title,
-				options.map((v) => ({ value: v, label: v >= 1000 ? formatMs(v) : `${v}` })),
-			);
-		};
+	const buildItems = (): SettingItem[] => [
+		{
+			id: "discoveryTimeoutMs",
+			label: "Discovery timeout",
+			description: "How long to wait for a server to answer before giving up on it. Raise it for machines that wake from sleep.",
+			currentValue: formatMs(s.discoveryTimeoutMs),
+			values: fmt([500, 1000, 1500, 2000, 3000, 5000]),
+		},
+		{
+			id: "pollIntervalMs",
+			label: "Poll interval",
+			description: "How often llama-infra re-checks, in the background, servers that are still loading a model.",
+			currentValue: formatMs(s.pollIntervalMs),
+			values: fmt([2000, 3000, 4000, 5000, 10_000]),
+		},
+		{
+			id: "pollMaxMs",
+			label: "Poll budget",
+			description: "Total time the background poller keeps retrying loading servers before it stops. Any new scan restarts it.",
+			currentValue: formatMs(s.pollMaxMs),
+			values: fmt([30_000, 60_000, 90_000, 120_000, 300_000]),
+		},
+		{
+			id: "startupGraceMs",
+			label: "Startup grace",
+			description: "Extra patience at pi startup while no server has answered yet, so slow machines still get discovered.",
+			currentValue: formatMs(s.startupGraceMs),
+			values: fmt([10_000, 20_000, 40_000, 60_000, 120_000]),
+		},
+		{
+			id: "knownGoodFailLimit",
+			label: "Known-good fail limit",
+			description: "Consecutive probe failures tolerated on an endpoint that used to work, before it is marked offline.",
+			currentValue: String(s.knownGoodFailLimit),
+			values: ["1", "2", "3", "5", "10"],
+		},
+		{
+			id: "detectVision",
+			label: "Vision detection",
+			description: "Detect image-capable models (mmproj files, /proc flags, server-reported modalities) and badge them 👁️.",
+			currentValue: onOff(s.detectVision),
+			values: ON_OFF,
+		},
+		{
+			id: "prefixModelIds",
+			label: "Prefix model IDs",
+			description: 'Register IDs as "host:port/model" so the same model on several machines never collides.',
+			currentValue: onOff(s.prefixModelIds),
+			values: ON_OFF,
+		},
+		{
+			id: "showBadgesInNames",
+			label: "Badges in names",
+			description: "Append 👁️ vision, 🚀 drafter and 💤 unloaded badges to model names in pi's model list.",
+			currentValue: onOff(s.showBadgesInNames),
+			values: ON_OFF,
+		},
+		{
+			id: "includeUnloadedRouterModels",
+			label: "Include unloaded models",
+			description: "In router mode, also list models the server knows about but has not loaded (slower to switch to).",
+			currentValue: onOff(s.includeUnloadedRouterModels),
+			values: ON_OFF,
+		},
+		{
+			id: "maxOutputTokens",
+			label: "Max output tokens",
+			description: "Ceiling sent as max_tokens for models that do not report their own limit. Raise it for longer generations.",
+			currentValue: formatTokens(s.maxOutputTokens),
+			values: [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536].map((v) => formatTokens(v)),
+		},
+		{
+			id: "requestTimeoutMs",
+			label: "Request timeout",
+			description: "Lower bound of the stream idle timeout for chat requests. Raise it if long local generations get aborted.",
+			currentValue: formatMs(s.requestTimeoutMs),
+			values: fmt([60_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000]),
+		},
+		{
+			id: "warmup",
+			label: "Header warmup",
+			description: "Pre-cache the system prompt on llama.cpp-family servers so the first real reply starts warm (prompt-cache hit).",
+			currentValue: onOff(s.warmup),
+			values: ON_OFF,
+		},
+	];
 
-		switch (action) {
-			case "timeout": {
-				const v = await pickNumber("⏱️ Discovery timeout", [500, 1000, 1500, 2000, 3000, 5000]);
-				if (v !== undefined) {
-					config.settings.discoveryTimeoutMs = v;
-					saveConfig(config);
-					ctx.ui.notify(`⏱️ Discovery timeout: ${formatMs(v)}`, "info");
+const durationOpts: Record<string, number[]> = {
+		discoveryTimeoutMs: [500, 1000, 1500, 2000, 3000, 5000],
+		pollIntervalMs: [2000, 3000, 4000, 5000, 10_000],
+		pollMaxMs: [30_000, 60_000, 90_000, 120_000, 300_000],
+		startupGraceMs: [10_000, 20_000, 40_000, 60_000, 120_000],
+		requestTimeoutMs: [60_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000],
+	};
+	const rescanOn = ["detectVision", "prefixModelIds", "showBadgesInNames", "includeUnloadedRouterModels", "maxOutputTokens"];
+
+	await settingsPanel(
+		ctx,
+		"⚙️ Discovery settings",
+		buildItems(),
+		{
+			onChange: (id, value) => {
+				const config = shared.activeConfig!;
+				const st = config.settings as Record<string, unknown>;
+				switch (id) {
+					case "detectVision":
+					case "prefixModelIds":
+					case "showBadgesInNames":
+					case "includeUnloadedRouterModels":
+					case "warmup":
+						st[id] = value === "true";
+						break;
+					case "knownGoodFailLimit":
+						config.settings.knownGoodFailLimit = parseInt(value, 10);
+						break;
+					case "maxOutputTokens": {
+						const v = [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536].find((n) => formatTokens(n) === value);
+						if (v !== undefined) config.settings.maxOutputTokens = v;
+						break;
+					}
+					default: {
+						const opts = id === "warmup" ? undefined : durationOpts[id];
+						const v = opts?.find((n) => formatMs(n) === value);
+						if (v !== undefined) st[id] = v;
+					}
 				}
-				break;
-			}
-			case "interval": {
-				const v = await pickNumber("🔁 Poll interval", [2000, 3000, 4000, 5000, 10_000]);
-				if (v !== undefined) {
-					config.settings.pollIntervalMs = v;
-					saveConfig(config);
-					ctx.ui.notify(`🔁 Poll interval: ${formatMs(v)}`, "info");
-				}
-				break;
-			}
-			case "budget": {
-				const v = await pickNumber("⏳ Poll budget", [30_000, 60_000, 90_000, 120_000, 300_000]);
-				if (v !== undefined) {
-					config.settings.pollMaxMs = v;
-					saveConfig(config);
-					ctx.ui.notify(`⏳ Poll budget: ${formatMs(v)}`, "info");
-				}
-				break;
-			}
-			case "grace": {
-				const v = await pickNumber("🌅 Startup grace", [10_000, 20_000, 40_000, 60_000, 120_000]);
-				if (v !== undefined) {
-					config.settings.startupGraceMs = v;
-					saveConfig(config);
-					ctx.ui.notify(`🌅 Startup grace: ${formatMs(v)}`, "info");
-				}
-				break;
-			}
-			case "faillimit": {
-				const v = await pickNumber("💀 Known-good fail limit", [1, 2, 3, 5, 10]);
-				if (v !== undefined) {
-					config.settings.knownGoodFailLimit = v;
-					saveConfig(config);
-					ctx.ui.notify(`💀 Known-good fail limit: ${v}`, "info");
-				}
-				break;
-			}
-			case "vision":
-				config.settings.detectVision = !config.settings.detectVision;
 				saveConfig(config);
-				ctx.ui.notify(`👁️ Vision detection ${config.settings.detectVision ? "ON" : "OFF"}`, "info");
-				await deps.rescan(ctx);
-				break;
-			case "prefix": {
-				if (config.settings.prefixModelIds) {
-					const ok = await ctx.ui.confirm(
-						"🏷️ Prefix model IDs",
-						"Turning the prefix OFF may cause ID collisions when the same model is served on several machines. Continue?",
-					);
-					if (!ok) break;
-				}
-				config.settings.prefixModelIds = !config.settings.prefixModelIds;
-				saveConfig(config);
-				ctx.ui.notify(`🏷️ Prefix model IDs ${config.settings.prefixModelIds ? "ON" : "OFF"}`, "info");
-				await deps.rescan(ctx);
-				break;
-			}
-			case "badges":
-				config.settings.showBadgesInNames = !config.settings.showBadgesInNames;
-				saveConfig(config);
-				ctx.ui.notify(`🏷️ Name badges ${config.settings.showBadgesInNames ? "ON" : "OFF"}`, "info");
-				await deps.rescan(ctx);
-				break;
-			case "unloaded":
-				config.settings.includeUnloadedRouterModels = !config.settings.includeUnloadedRouterModels;
-				saveConfig(config);
-				ctx.ui.notify(
-					`💤 Include unloaded router models ${config.settings.includeUnloadedRouterModels ? "ON" : "OFF"}`,
-					"info",
-				);
-				await deps.rescan(ctx);
-				break;
-			case "warmup":
-				config.settings.warmup = !config.settings.warmup;
-				saveConfig(config);
-				ctx.ui.notify(`☕ Header warmup ${config.settings.warmup ? "ON" : "OFF"}`, "info");
-				break;
-			case "maxtokens": {
-				const v = await pickNumber("📏 Max output tokens", [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536]);
-				if (v !== undefined) {
-					config.settings.maxOutputTokens = v;
-					saveConfig(config);
-					ctx.ui.notify(`📏 Max output tokens: ${v.toLocaleString()}`, "info");
-					await deps.rescan(ctx);
-				}
-				break;
-			}
-			case "timeoutfloor": {
-				const v = await pickNumber("⏱️ Request timeout", [60_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000]);
-				if (v !== undefined) {
-					config.settings.requestTimeoutMs = v;
-					saveConfig(config);
-					ctx.ui.notify(`⏱️ Request timeout: ${formatMs(v)}`, "info");
-				}
-				break;
-			}
-			case "reset": {
-				const ok = await ctx.ui.confirm("♻️ Reset settings", "Restore all discovery settings to their defaults?");
-				if (ok) {
-					config.settings = { ...DEFAULT_SETTINGS };
-					saveConfig(config);
-					ctx.ui.notify("♻️ Settings reset to defaults", "info");
-					await deps.rescan(ctx);
-				}
-				break;
-			}
-		}
-	}
+				ctx.ui.notify(`⚙️ ${settingLabel(id)} = ${value}`, "info");
+			},
+			onRerun: rescanOn,
+		},
+	);
 }
+
+// ── Connectivity test ──────────────────────────────────────────────────────
 
 // ── Connectivity test ──────────────────────────────────────────────────────
 export async function testConnectivity(ctx: ExtensionContext): Promise<void> {
