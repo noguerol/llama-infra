@@ -106,12 +106,33 @@ export function withLocalRuntimeDefaults(options: StreamOptions, floorMs?: numbe
 	};
 }
 
+/**
+ * Map a pi-visible model to the model object sent to the server.
+ *
+ * pi-visible ids are decorated with a "(host:port)" tag to disambiguate
+ * across machines, but OpenAI-compatible servers (vLLM/SGLang/TGI/AMDahl)
+ * only know the raw served model id and answer 404 "model does not exist"
+ * for the decorated one. The main session rewrites this in the
+ * `before_provider_request` hook, but nested calls made by other extensions
+ * through ctx.modelRegistry.complete()/streamSimple() never traverse that
+ * hook — so the rewrite must also happen inside the provider stream itself.
+ */
+export function toServerRequestModel<T extends { id?: string }>(
+	model: T,
+	ids: Map<string, string> = shared.serverModelIds,
+): T {
+	const id = typeof model?.id === "string" ? model.id : undefined;
+	const raw = id !== undefined ? ids.get(id) : undefined;
+	return raw !== undefined && raw !== id ? { ...model, id: raw } : model;
+}
+
 export function createLongTimeoutOpenAICompletionsStream(model: any, context: any, options?: Record<string, any>) {
 	const out = new ForwardedAssistantMessageEventStream();
 	void (async () => {
 		try {
 			const streamSimple = await loadOpenAICompletionsStreamSimple();
-			const inner = streamSimple(model, context, withLocalRuntimeDefaults(options, activeRequestTimeoutMs()));
+			const requestModel = toServerRequestModel(model);
+			const inner = streamSimple(requestModel, context, withLocalRuntimeDefaults(options, activeRequestTimeoutMs()));
 			for await (const event of inner) out.push(event);
 			if (typeof inner.result === "function") out.end(await inner.result());
 			else out.end();
