@@ -46,8 +46,20 @@ function toPiModel(
 ): PiModel {
 	const rawId = String(model.id ?? "");
 	const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
-	const machineTag = settings.prefixModelIds ? ` (${hostPort})` : "";
 	const kind = ep.server;
+
+	// A server may publish a model id that already embeds this machine's tag —
+	// e.g. a vLLM started with `--served-model-name "Example-27B (gpu-host:8000)"`.
+	// The tag is only needed to disambiguate across machines, so add it only
+	// when the raw id doesn't already carry it. Compare case-insensitively:
+	// hostPort is lowercased by idSafeHost, but a served-model-name may use any
+	// casing. An empty raw id gets no tag (nothing to disambiguate). Crucially,
+	// `serverModelId` must ALWAYS stay the raw server id: it is what gets sent
+	// in the request payload, and a display-shaped id (with the tag) makes
+	// OpenAI-compatible servers (vLLM/SGLang/TGI) answer 404 "model does not
+	// exist".
+	const hasTag = rawId.toLowerCase().includes(`(${hostPort})`);
+	const machineTag = settings.prefixModelIds && rawId !== "" && !hasTag ? ` (${hostPort})` : "";
 
 	const common = {
 		baseUrl: ep.baseUrl,
@@ -189,7 +201,12 @@ export function buildAndRegisterProvider(
 			const pm = toPiModel(model, ep, srv, settings, modelMeta);
 			const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
 
-			// ID collision guard.
+			// ID collision guard. `toPiModel` already appends the (host:port) tag
+			// when the raw id doesn't carry it; here we only add it for the raw id
+			// itself (which the tag is meant to disambiguate) and then a numeric
+			// suffix for any remaining clash. Never touch serverModelId: it must
+			// stay the raw server id or the request payload goes out with a
+			// display-shaped id and OpenAI-compatible servers answer 404.
 			if (seenIds.has(pm.id)) {
 				if (!pm.id.includes(`(${hostPort})`)) pm.id = `${pm.id} (${hostPort})`;
 				let n = 2;

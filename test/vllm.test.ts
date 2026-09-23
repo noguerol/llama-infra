@@ -6,7 +6,7 @@
 // Run: node --experimental-strip-types test/vllm.test.ts
 
 import * as http from "node:http";
-import { DEFAULT_SETTINGS, supportsThinkingBudget, thinkingBudgetField } from "../src/core.ts";
+import { DEFAULT_SETTINGS, shared, supportsThinkingBudget, thinkingBudgetField } from "../src/core.ts";
 import { createMetrics } from "../src/metrics.ts";
 import { buildAndRegisterProvider } from "../src/registration.ts";
 import { detectServerKind } from "../src/scan.ts";
@@ -247,6 +247,133 @@ check(
 );
 check("endpoint kind recorded as vllm", vllmModel?.endpoint?.kind === "vllm");
 check("provider streamSimple still wired", typeof registeredProvider?.streamSimple === "function");
+
+// ── 5) Regression: a server id that already embeds the (host:port) tag ────
+// Reproduction of the gpu-host:8000 incident: a vLLM started with
+// `--served-model-name "Example-27B (gpu-host:8000)"` publishes a model whose id
+// already contains the tag this extension appends for disambiguation. The
+// registered id must NOT be double-tagged, and — decisively — serverModelId
+// must stay the raw server id so the request payload is not sent with a
+// display-shaped id (which makes vLLM answer 404 "model does not exist").
+console.log("vllm: raw id that already carries the (host:port) tag");
+
+const configTagged: InfraConfig = {
+	servers: [{ id: "bruma-2", host: "bruma", ports: [8082], enabled: true }],
+	settings: { ...DEFAULT_SETTINGS },
+	modelOptions: {},
+};
+
+const scanTagged: ScanResult = {
+	totalModels: 2,
+	serversUp: 1,
+	serversTotal: 1,
+	endpoints: [
+		{
+			ok: true,
+			serverId: "bruma-2",
+			label: "bruma 7900xtx",
+			host: "bruma",
+			port: 8082,
+			baseUrl: "http://gpu-host:8000/v1",
+			server: "vllm",
+			mode: "single",
+			latencyMs: 1,
+			models: [
+				{
+					id: "Example-27B",
+					object: "model",
+					owned_by: "vllm",
+					max_model_len: 115000,
+				},
+				{
+					id: "Example-27B (gpu-host:8000)",
+					object: "model",
+					owned_by: "vllm",
+					max_model_len: 115000,
+				},
+			],
+			meta: new Map(),
+		},
+	],
+};
+
+const taggedModels = buildAndRegisterProvider(pi, scanTagged, configTagged, { persistCache: false });
+const realModel = taggedModels.find((m) => m.serverModelId === "Example-27B");
+const taggedModel = taggedModels.find((m) => m.serverModelId === "Example-27B (gpu-host:8000)");
+
+check(
+	"real model id is not double-tagged",
+	realModel?.id === "Example-27B (gpu-host:8000)",
+	realModel?.id,
+);
+check(
+	"server id that already carries the tag is not double-tagged (no '(gpu-host:8000)' twice)",
+	taggedModel?.id === "Example-27B (gpu-host:8000)-2",
+	taggedModel?.id,
+);
+check(
+	"serverModelId stays the raw server id (never the display name)",
+taggedModel?.serverModelId === "Example-27B (gpu-host:8000)",
+taggedModel?.serverModelId,
+);
+check(
+	"the two models get distinct registered ids (numeric suffix on clash)",
+	realModel && taggedModel && realModel.id !== taggedModel.id,
+	`${realModel?.id} / ${taggedModel?.id}`,
+);
+check(
+	"exactly one model is registered per raw server id (no phantom duplicate)",
+	taggedModels.length === 2,
+	String(taggedModels.length),
+);
+
+// Case-insensitivity: a served-model-name may embed the tag in a different
+// casing than idSafeHost produces (which lowercases the host). The tag must
+// still be recognized so the id is not double-tagged.
+console.log("vllm: tag match is case-insensitive");
+
+shared.serverModelIds.clear();
+shared.compactModelIds.clear();
+
+const scanCase: ScanResult = {
+	totalModels: 1,
+	serversUp: 1,
+	serversTotal: 1,
+	endpoints: [
+		{
+			ok: true,
+			serverId: "bruma-2",
+			label: "bruma 7900xtx",
+			host: "bruma",
+			port: 8082,
+			baseUrl: "http://gpu-host:8000/v1",
+			server: "vllm",
+			mode: "single",
+			latencyMs: 1,
+			models: [
+				{
+					id: "Example-27B (BRUMA:8082)",
+					object: "model",
+					owned_by: "vllm",
+					max_model_len: 115000,
+				},
+			],
+			meta: new Map(),
+		},
+	],
+};
+
+const caseModels = buildAndRegisterProvider(pi, scanCase, configTagged, { persistCache: false });
+check(
+	"uppercase tag is recognized (no double-tagging)",
+	caseModels[0]?.id === "Example-27B (BRUMA:8082)",
+	caseModels[0]?.id,
+);
+check(
+	"serverModelId stays the raw id for a case-differing tag",
+	caseModels[0]?.serverModelId === "Example-27B (BRUMA:8082)",
+	caseModels[0]?.serverModelId,
+);
 
 if (failures > 0) {
 	console.error(`\nvllm tests failed: ${failures}`);

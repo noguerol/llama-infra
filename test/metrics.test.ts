@@ -19,21 +19,29 @@ function check(label: string, cond: boolean, detail?: string): void {
 // ── Fake llama-server with --metrics ───────────────────────────────────────
 // Gauges mirror the live rate: non-zero only while the server is actually
 // processing (like a real llama.cpp server).
+//
+// Counters are computed in the HTTP handler (not in a growth interval) so
+// they always reflect the current wall-clock time, not a stale tick value.
+// This makes the counter-delta rate exactly 5000 t/s regardless of poll
+// timing or tick frequency.
+let grow = false;
+let growStart = 0; // Date.now() when growth began
 let promptTotal = 3000;
 let predictedTotal = 120;
 let processing = 2;
-let grow = false;
 let promptGauge = 150;
 let predictedGauge = 18;
 
-const growth = setInterval(() => {
-	if (!grow) return;
-	promptTotal += 500; // ≈ 5000 t/s
-	predictedTotal += 50; // ≈ 500 t/s
-}, 100);
+const GROWTH_RATE = { prompt: 5000, predicted: 500 }; // tokens per second
 
 const server = http.createServer((req, res) => {
 	if (req.url === "/metrics") {
+		// Compute counters from current wall-clock time so they're always fresh.
+		if (grow) {
+			const elapsed = (Date.now() - growStart) / 1000;
+			promptTotal = 3000 + GROWTH_RATE.prompt * elapsed;
+			predictedTotal = 120 + GROWTH_RATE.predicted * elapsed;
+		}
 		res.writeHead(200, { "Content-Type": "text/plain" });
 		const pg = grow ? 5000 : processing > 0 ? promptGauge : 0;
 		const gg = grow ? 500 : processing > 0 ? predictedGauge : 0;
@@ -102,8 +110,13 @@ check(
 );
 
 // Advance server counters continuously → polls derive rates from counter deltas.
+// Wait one poll cycle so the first poll after growStart captures a fresh
+// prev snapshot, then the next poll computes the delta from that point —
+// giving exactly 5000/500 t/s regardless of poll timing.
 grow = true;
-await new Promise((r) => setTimeout(r, 900)); // a few polls at ~5000/500 t/s
+growStart = Date.now();
+await new Promise((r) => setTimeout(r, 400)); // one poll cycle: capture fresh prev
+await new Promise((r) => setTimeout(r, 500)); // next poll: compute delta from fresh prev
 check(
 	"counter-delta rates (⚡≈5000 t/s, 🔥≈500 t/s)",
 	/⚡ 4[5-9][0-9][0-9]|⚡ 5[0-5][0-9][0-9]/.test(lines.join()) &&
@@ -118,7 +131,6 @@ check("plain idle when server idle", lines.join() === "⏸", lines.join());
 
 poller.stop(ctx);
 await new Promise((r) => setTimeout(r, 100));
-clearInterval(growth);
 server.close();
 
 if (failures > 0) {

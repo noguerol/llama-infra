@@ -188,18 +188,47 @@ export function isNetworkError(msg: string): boolean {
 
 // ── Model display names ────────────────────────────────────────────────────
 export function cleanModelName(rawId: string): string {
+	// Shared suffix-stripping regexes. Applied to the base name (before the
+	// tag) so they work whether or not a tag follows.
+	const suffixes: RegExp[] = [
+		/\.(gguf|ggml)(?:\.tar)?$/i,
+		/[-_.][Ff](?:16|32)$/i,
+		/[-_.][Qq]2_[Kk]$/i,
+		/[-_.][Qq]3_[Kk]_[SLM]$/i,
+		/[-_.][Qq]4_[01]|[-_.][Qq]4_[Kk]_[MS]$/i,
+		/[-_.][Qq]5_[0K]_[MS]$/i,
+		/[-_.][Qq]6_[Kk](_[A-Z])?$/i,
+		/[-_.][Qq]8_[0O]$/i,
+		/-(?:Uncensored|Alpaca|Instruct|Chat|Turbo|Base|MoE|UD)(?:-[a-zA-Z0-9]+)*$/i,
+		/-(?:v[0-9.]+)(?:-[a-zA-Z0-9]+)*$/i,
+		/-+$/,
+	];
+	function stripSuffixes(name: string): string {
+		let n = name;
+		for (const re of suffixes) n = n.replace(re, "");
+		return n.trim();
+	}
+
+	// If the id contains a (host:port) tag, handle it specially: the tag may
+	// contain a "/" (e.g. "Qwen (gpu-host:8000/)") or the id may have a path
+	// prefix (e.g. "/models/Qwen (gpu-host:8000)"). In both cases, extract the
+	// tag, clean the base name (strip path + quant suffixes), and re-attach
+	// the tag with the "/" stripped.
+	const tagMatch = rawId.match(/\(([^)]*)\)$/);
+	if (tagMatch) {
+		const base = rawId.slice(0, tagMatch.index);
+		const tagInner = tagMatch[1];
+		// Clean the base name: strip path prefix, trim, then quant/format suffixes.
+		let cleanBase = base.split("/").pop()?.trim() || base;
+		cleanBase = stripSuffixes(cleanBase);
+		// Clean the tag: strip trailing slashes.
+		const cleanTag = tagInner.replace(/\/+$/, "");
+		// If the base is empty, don't prepend a space before the tag.
+		const prefix = cleanBase ? `${cleanBase} ` : "";
+		return `${prefix}(${cleanTag})`;
+	}
 	let name = rawId.split("/").pop() || rawId;
-	name = name.replace(/\.(gguf|ggml)(?:\.tar)?$/i, "");
-	name = name.replace(/[-_.][Ff](?:16|32)$/i, "");
-	name = name.replace(/[-_.][Qq]2_[Kk]$/i, "");
-	name = name.replace(/[-_.][Qq]3_[Kk]_[SLM]$/i, "");
-	name = name.replace(/[-_.][Qq]4_[01]|[-_.][Qq]4_[Kk]_[MS]$/i, "");
-	name = name.replace(/[-_.][Qq]5_[0K]_[MS]$/i, "");
-	name = name.replace(/[-_.][Qq]6_[Kk](_[A-Z])?$/i, "");
-	name = name.replace(/[-_.][Qq]8_[0O]$/i, "");
-	name = name.replace(/-(?:Uncensored|Alpaca|Instruct|Chat|Turbo|Base|MoE|UD)(?:-[a-zA-Z0-9]+)*$/i, "");
-	name = name.replace(/-(?:v[0-9.]+)(?:-[a-zA-Z0-9]+)*$/, "");
-	name = name.replace(/-+$/, "").trim();
+	name = stripSuffixes(name);
 	return name || rawId;
 }
 
