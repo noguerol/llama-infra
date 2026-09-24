@@ -4,7 +4,7 @@
 
 import * as http from "node:http";
 import { readFileSync, readdirSync } from "node:fs";
-import { baseName, compactIdFor, isLocalHost, modelOptions, serverLabel, shared } from "./core.ts";
+import { baseName, isLocalHost, modelOptionsFor, serverLabel, shared } from "./core.ts";
 import type {
 	EndpointResult,
 	HttpResult,
@@ -14,7 +14,6 @@ import type {
 	LmStudioModelsResponse,
 	LocalServerInfo,
 	ModelMetadata,
-	ModelOptions,
 	ParsedServerArgs,
 	ScanResult,
 	ServerConfig,
@@ -436,12 +435,6 @@ export async function probeDs4Server(
 }
 
 // ── Per-model metadata ─────────────────────────────────────────────────────
-/** Resolve `modelOptions` by raw server id, falling back to its compact/registered id. */
-function resolveModelOptions(rawId: string): ModelOptions | undefined {
-	const options = modelOptions();
-	return options[rawId] ?? options[compactIdFor(rawId) ?? rawId];
-}
-
 export function buildModelMetadata(
 	rawId: string,
 	entry: LlamaCppModel,
@@ -476,7 +469,7 @@ export function buildModelMetadata(
 	else if (!meta.drafter && local?.hasDraft) meta.drafter = "draft model";
 
 	// Manual overrides win: vLLM publishes neither modalities nor drafter.
-	const override = resolveModelOptions(rawId);
+	const override = modelOptionsFor(rawId);
 	if (override?.vision !== undefined) meta.vision = override.vision;
 	if (override?.drafter !== undefined) meta.drafter = override.drafter;
 

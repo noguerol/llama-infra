@@ -365,6 +365,29 @@ export function modelOptions(): Record<string, ModelOptions> {
 	return shared.activeConfig?.modelOptions ?? {};
 }
 
+/** Resolve per-model config overrides for a raw server model id: accepts the
+ *  raw id, its registered compact id, the display id `<raw id> (host:port)`,
+ *  or a legacy "host:port/<raw id>" key (the legacy form registration.ts
+ *  migrates forward). */
+export function modelOptionsFor(rawId: string): ModelOptions | undefined {
+	if (!rawId) return undefined;
+	const opts = modelOptions();
+	if (opts[rawId]) return opts[rawId];
+	const compact = compactIdFor(rawId);
+	if (compact && opts[compact]) return opts[compact];
+	// Display ids: "<raw id> (host:port)" (compact form registered in pi).
+	const prefix = `${rawId} (`;
+	for (const key of Object.keys(opts)) {
+		if (key.startsWith(prefix) && key.endsWith(")")) return opts[key];
+	}
+	// Legacy keys: "<host>:<port>/<raw id>" (see registration.ts migration).
+	const rawSuffix = `/${rawId.replace(/^\/+/, "")}`;
+	for (const key of Object.keys(opts)) {
+		if (key.endsWith(rawSuffix)) return opts[key];
+	}
+	return undefined;
+}
+
 /** Compact id registered in pi for a raw server model id (or the input). */
 export function compactIdFor(modelId: string | undefined): string | undefined {
 	if (!modelId) return undefined;

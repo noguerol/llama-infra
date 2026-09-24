@@ -111,15 +111,36 @@ curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.
 
 **Metrics** — Prometheus names are normalized from the `vllm:` namespace (just like `llamacpp:`), so the footer ⚡/🔥 and `▶n` (other clients) readings work unchanged. Generation rate is read from `vllm:generation_tokens_total`.
 
-**Manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info, and the local process scanner only recognizes `llama-server`. Set them explicitly per model:
+**Manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info, and the local process scanner only recognizes `llama-server`. Set them explicitly per model under `modelOptions`. The key may be the **raw server id** (`/v1/models` → `id`) or the **registered name shown by `/model`**, which appends the ` (host:port)` suffix:
 
 ```json
-{ "modelOptions": { "example-vllm-model": { "vision": false, "drafter": "DFlash2 15/7" } } }
+{
+  "modelOptions": {
+    "Example-27B (gpu-host:8000)": { "vision": true },
+    "example-vllm-model": { "vision": false, "drafter": "DFlash2 15/7" }
+  }
+}
+```
+
+The resolver accepts both forms (raw id, registered display id, and the legacy `host:port/<raw id>` key) at scan **and** registration time, so the override survives rescans and does not depend on the compact-id cache being warm. Overrides always win over server-reported data, so `vision: false` also disables a wrongly detected tower.
+
+**models.json fallback (published npm build)** — if you cannot edit the extension, force the input modality from pi's own `~/.pi/agent/models.json`. Use the provider id **`llama-infra`** (not `llamacpp-infra`) and `modelOverrides`, which merges onto the extension-provided model instead of replacing it (a `providers.*.models` entry would replace the model and drop its `contextWindow`, `reasoning` and headers):
+
+```json
+{
+  "providers": {
+    "llama-infra": {
+      "modelOverrides": {
+        "Example-27B (gpu-host:8000)": { "input": ["text", "image"] }
+      }
+    }
+  }
+}
 ```
 
 **Known limitations**
 
-- Vision is never auto-detected — force it with `modelOptions[id].vision = true`.
+- vLLM does not report `modalities`, so vision is never auto-detected — force it with `modelOptions[id].vision = true`, using either the raw server id or the registered name with the ` (host:port)` suffix.
 - Drafter/spec-decode gets no name badge unless set via `modelOptions[id].drafter`; when vLLM exposes `vllm:spec_decode_*`, the footer shows the drafter acceptance ratio (`🎯`).
 - `cacheK`/`cacheV` KV-quant badges stay empty (GGUF/llama.cpp-specific).
 - No `/slots`, so server-side idle stats come from `vllm:num_requests_running`, plus the spec-decode acceptance ratio (`🎯`) and prefix-cache hit ratio (`♻️`) derived from the `vllm:` counters.

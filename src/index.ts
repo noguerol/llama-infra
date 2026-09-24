@@ -14,6 +14,7 @@ import {
 	loadConfig,
 	loadModelsCache,
 	modelOptions,
+	modelOptionsFor,
 	normalizeLevel,
 	rawIdFor,
 	saveConfig,
@@ -24,28 +25,7 @@ import {
 import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
 import { resolveCostProfile } from "./cost.ts";
 import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
-import type { ModelOptions } from "./types.ts";
-
-/**
- * Resolve per-model config overrides for a raw server model id: accepts the raw
- * id, its registered compact id, or a legacy "host:port/<raw id>" key (the
- * legacy form registration.ts migrates forward). Reuses the shared compact-id
- * map instead of duplicating it. Exported for scan.ts (vLLM cannot publish
- * modalities/drafter overrides).
- */
-export function modelOptionsFor(rawId: string): ModelOptions | undefined {
-	if (!rawId) return undefined;
-	const opts = modelOptions();
-	if (opts[rawId]) return opts[rawId];
-	const compact = compactIdFor(rawId);
-	if (compact && opts[compact]) return opts[compact];
-	// Legacy keys: "<host>:<port>/<raw id>" (see registration.ts migration).
-	const rawSuffix = `/${rawId.replace(/^\/+/, "")}`;
-	for (const key of Object.keys(opts)) {
-		if (key.endsWith(rawSuffix)) return opts[key];
-	}
-	return undefined;
-}
+export { modelOptionsFor };
 
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
