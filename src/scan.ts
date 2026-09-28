@@ -40,6 +40,7 @@ export function extractQuantTag(filenameOrId: string): string | undefined {
 // ── llama-server flag parsing ──────────────────────────────────────────────
 export function parseServerArgs(tokens: string[]): ParsedServerArgs {
 	const out: ParsedServerArgs = {};
+	let textOnly = false;
 	const take = (i: number): string | undefined => {
 		const v = tokens[i + 1];
 		return v && !v.startsWith("-") ? v : undefined;
@@ -63,9 +64,39 @@ export function parseServerArgs(tokens: string[]): ParsedServerArgs {
 		} else if (t === "--mmproj") {
 			out.hasMmproj = true;
 			if (val) out.mmprojPath = val;
+		} else if (t === "--language-model-only") textOnly = true;
+		else if (t === "--limit-mm-per-prompt" || t === "--limit_mm_per_prompt") {
+			const limit = imageLimitFromArg(val);
+			if (limit !== undefined) out.acceptsImages = limit > 0;
 		}
 	}
+	if (textOnly) out.acceptsImages = false;
 	return out;
+}
+
+/** Parse vLLM's --limit-mm-per-prompt value: JSON map ({"image":2}) or the
+ *  legacy comma-separated key=value form (image=2). Returns the image limit, or
+ *  undefined when there is no image entry. */
+function imageLimitFromArg(raw: string | undefined): number | undefined {
+	if (!raw) return undefined;
+	let limit: unknown;
+	try {
+		const parsed = JSON.parse(raw);
+		if (parsed && typeof parsed === "object") limit = (parsed as Record<string, unknown>).image;
+	} catch {
+		// legacy key=value form below
+	}
+	if (limit === undefined) {
+		for (const part of raw.split(",")) {
+			const [k, v] = part.split("=").map((s) => s.trim());
+			if (k === "image") {
+				limit = v;
+				break;
+			}
+		}
+	}
+	const n = typeof limit === "number" ? limit : parseInt(String(limit), 10);
+	return Number.isFinite(n) ? n : undefined;
 }
 
 // ── Local /proc scan (loopback only) ───────────────────────────────────────
@@ -90,6 +121,14 @@ function looksLikeVllmProcess(args: string[]): boolean {
 	return joined.includes("vllm") || joined.includes("ornith");
 }
 
+export function looksLikeOpenAiEngine(args: string[]): boolean {
+	const joined = args.join("\0").toLowerCase();
+	if (joined.includes("vllm") || joined.includes("ornith") || joined.includes("sglang")) return true;
+	const has = (f: string) => args.some((a) => a === f || a.startsWith(f + "="));
+	if (!has("--served-model-name")) return false;
+	return has("--max-model-len") || has("--tensor-parallel-size") || has("--gpu-memory-utilization") || has("--kv-cache-dtype") || has("--limit-mm-per-prompt") || has("--language-model-only");
+}
+
 export function scanLocalServers(): Map<number, LocalServerInfo> {
 	const found = new Map<number, LocalServerInfo>();
 	let pids: string[] = [];
@@ -104,11 +143,12 @@ export function scanLocalServers(): Map<number, LocalServerInfo> {
 			const args = readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").filter(Boolean);
 			const bin = (args[0] ?? "").split("/").pop() ?? "";
 			const isLlama = bin.startsWith("llama-server");
-			if (!isLlama && !looksLikeVllmProcess(args)) continue;
+			if (!isLlama && !looksLikeVllmProcess(args) && !looksLikeOpenAiEngine(args)) continue;
 			const port = portFromArgs(args);
 			if (port === undefined) continue;
-			// Python/vLLM engines expose no GGUF flags, so only the port hint applies.
-			const parsed = isLlama ? parseServerArgs(args) : {};
+			// OpenAI-compatible wrappers expose no GGUF flags; only the port and the
+			// vision-relevant args parsed above (acceptsImages) apply.
+			const parsed = parseServerArgs(args);
 			found.set(port, { port, ...parsed });
 		} catch {
 			// process vanished between readdir and read — ignore
@@ -455,6 +495,10 @@ export function buildModelMetadata(
 		meta.vision = true;
 	}
 	if (!meta.vision && local?.hasMmproj) meta.vision = true;
+	// Local engine args are ground truth for OpenAI-compatible engines:
+	// --language-model-only makes vLLM answer 400 'At most 0 image(s)', while
+	// --limit-mm-per-prompt {"image":N} with N>0 means images are accepted.
+	if (local?.acceptsImages !== undefined) meta.vision = local.acceptsImages;
 
 	// Drafter.
 	const argsInfo = entry.status?.args ? parseServerArgs(entry.status.args) : undefined;

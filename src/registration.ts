@@ -8,6 +8,7 @@ import {
 	idSafeHost,
 	makeCompat,
 	modelOptions,
+	modelOptionsFor,
 	saveConfig,
 	saveModelsCache,
 	shared,
@@ -200,6 +201,14 @@ export function buildAndRegisterProvider(
 			const modelMeta = ep.meta.get(rawId) ?? {};
 			const pm = toPiModel(model, ep, srv, settings, modelMeta);
 			const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
+
+			// Per-model output cap override (modelOptions[id].maxTokens): wins over
+			// both the server-reported max_tokens and settings.maxOutputTokens, and
+			// is clamped to the model contextWindow. Invalid values are ignored.
+			const overrideMax = modelOptionsFor(rawId)?.maxTokens;
+			if (typeof overrideMax === "number" && Number.isFinite(overrideMax) && overrideMax > 0) {
+				pm.maxTokens = Math.min(Math.floor(overrideMax), pm.contextWindow);
+			}
 
 			// ID collision guard. `toPiModel` already appends the (host:port) tag
 			// when the raw id doesn't carry it; here we only add it for the raw id

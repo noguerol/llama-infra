@@ -48,6 +48,8 @@ export interface ModelOptions {
 	vision?: boolean;
 	/** Informative drafter/spec-decode label (vLLM does not publish it). */
 	drafter?: string;
+	/** Per-model output cap; wins over the server-reported max_tokens and over settings.maxOutputTokens; clamped to the model contextWindow. */
+	maxTokens?: number;
 }
 
 export interface SettingsConfig {
@@ -213,6 +215,9 @@ export interface ParsedServerArgs {
 	hasDraft?: boolean;
 	hasMmproj?: boolean;
 	mmprojPath?: string;
+	/** OpenAI-compatible engines (vLLM & co): does the served model accept images?
+	 *  false = --language-model-only or an image limit of 0; undefined = unknown. */
+	acceptsImages?: boolean;
 }
 
 export interface LocalServerInfo extends ParsedServerArgs {

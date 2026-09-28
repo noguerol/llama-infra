@@ -111,7 +111,14 @@ curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.
 
 **Metrics** — Prometheus names are normalized from the `vllm:` namespace (just like `llamacpp:`), so the footer ⚡/🔥 and `▶n` (other clients) readings work unchanged. Generation rate is read from `vllm:generation_tokens_total`.
 
-**Manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info, and the local process scanner only recognizes `llama-server`. Set them explicitly per model under `modelOptions`. The key may be the **raw server id** (`/v1/models` → `id`) or the **registered name shown by `/model`**, which appends the ` (host:port)` suffix:
+**Local vision detection & manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info over HTTP. For **local engines** (loopback host, with `detectVision` enabled) llama-infra now reads the engine's own process args from `/proc` and uses them as ground truth for vision:
+
+- `--language-model-only`, or `--limit-mm-per-prompt '{"image":0}'` → **text-only**;
+- `--limit-mm-per-prompt '{"image":N}'` with `N > 0` → **vision**.
+
+Wrappers whose process is not literally named `vllm` are still recognized by their flag surface — an OpenAI-style launcher that carries `--served-model-name` together with `--max-model-len`, `--tensor-parallel-size` or `--gpu-memory-utilization` — so a line such as `python3 /usr/local/bin/paiton-qwen38 serve … --served-model-name my-model --max-model-len 32768` is covered too.
+
+The manual `modelOptions[id].vision` override remains the **final word**: it wins over both server-reported data and the process-arg ground truth, and it is still **required for remote/non-loopback vLLM servers**, which expose no `/proc`. Set vision/drafter explicitly per model under `modelOptions`. The key may be the **raw server id** (`/v1/models` → `id`) or the **registered name shown by `/model`**, which appends the ` (host:port)` suffix:
 
 ```json
 {
@@ -140,12 +147,12 @@ The resolver accepts both forms (raw id, registered display id, and the legacy `
 
 **Known limitations**
 
-- vLLM does not report `modalities`, so vision is never auto-detected — force it with `modelOptions[id].vision = true`, using either the raw server id or the registered name with the ` (host:port)` suffix.
+- vLLM does not report `modalities` over HTTP. For local loopback engines with `detectVision` enabled, vision is inferred from the process args (`--language-model-only` / `--limit-mm-per-prompt '{"image":0}'` → text-only; `--limit-mm-per-prompt '{"image":N>0}'` → vision), including non-`vllm`-named wrappers detected by their flag surface. Remote servers keep HTTP-only detection, so force vision there with `modelOptions[id].vision = true` (raw server id or registered name with the ` (host:port)` suffix); the manual override always wins.
 - Drafter/spec-decode gets no name badge unless set via `modelOptions[id].drafter`; when vLLM exposes `vllm:spec_decode_*`, the footer shows the drafter acceptance ratio (`🎯`).
 - `cacheK`/`cacheV` KV-quant badges stay empty (GGUF/llama.cpp-specific).
 - No `/slots`, so server-side idle stats come from `vllm:num_requests_running`, plus the spec-decode acceptance ratio (`🎯`) and prefix-cache hit ratio (`♻️`) derived from the `vllm:` counters.
 - vLLM serves one model per process; the server `mode` stays `single`.
-- The server enforces a hard limit and returns HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`; a correct `contextWindow` keeps pi's compaction predictable.
+- The server enforces a hard limit and returns HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`; a correct `contextWindow` keeps pi's compaction predictable. When only one model needs a lower generation cap, set `modelOptions[id].maxTokens` (see [Per-model output cap](#per-model-output-cap-maxtokens)) instead of lowering the global `settings.maxOutputTokens`.
 - This particular server does not validate types (e.g. `enable_thinking: "false"` is accepted); pi always sends proper booleans.
 
 **Ready-to-paste `~/.pi/agent/llama-infra.json`**
@@ -368,7 +375,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `prefixModelIds` | `true` | Append the machine tag `(host:port)` to model ids; OFF keeps bare names and only disambiguates collisions |
 | `showBadgesInNames` | `true` | Append 👁️🚀💤 badges to model display names |
 | `includeUnloadedRouterModels` | `false` | Router mode: list models that are not currently loaded |
-| output cap | `32768` | Registered per model as `maxTokens` unless the server reports an explicit `max_tokens`; still bounded by available context |
+| `maxOutputTokens` | `32768` | Global fallback for every model's `maxTokens`. A server-reported `max_tokens` and the per-model `modelOptions[id].maxTokens` override take precedence, and the result is clamped to the model's `contextWindow` (see [Per-model output cap](#per-model-output-cap-maxtokens)) |
 | request timeout | `1200000` | 20 minute timeout floor applied to llama-infra OpenAI-compatible streams |
 | `warmup` | `true` | Pre-cache system prompt KV on llama.cpp servers |
 | `metricsEnabled` | `true` | Show live speed & metrics in the footer for llama-infra models |
@@ -381,6 +388,36 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 llama.cpp accepts `thinking_budget_tokens` per request; vLLM instead accepts `thinking_token_budget` (the extension picks the right field per server kind). Configure budgets per thinking level per model through the config menu (`🧠 Thinking budgets` → select model → set level). Models with any budget configured are registered with `reasoning: true`, and pi sends the budget automatically when the thinking level matches.
 
 Levels: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
+
+### Per-model output cap (`maxTokens`)
+
+A model's output cap can be overridden per model with `modelOptions[id].maxTokens` — useful when one model needs a different (usually smaller) generation cap than the rest, without changing the setting for every other model. Configure it from `/llama-infra config` → **📏 Output caps** (pick a model → set or clear the cap), or edit `modelOptions` directly.
+
+**Precedence** — the effective `maxTokens` is resolved in this order, first match wins:
+
+1. `modelOptions[id].maxTokens` — manual override.
+2. the server-reported `max_tokens`, when the server publishes one.
+3. `settings.maxOutputTokens` — global fallback (default `32768`).
+
+The per-model override is then **clamped to the model's `contextWindow`**, so it can never register a cap larger than the served context (a server-reported `max_tokens` is used as-is).
+
+**Accepted keys** — `modelOptions` entries resolve the same three key forms everywhere (raw id, registered display id, legacy key), so an override survives rescans:
+
+- the **raw server id** (`/v1/models` → `id`), e.g. `example-vllm-model`;
+- the **registered display id** shown by `/model`, i.e. `<raw id> (host:port)`, e.g. `example-vllm-model (127.0.0.1:8081)`;
+- the **legacy** `host:port/<raw id>` key, e.g. `127.0.0.1:8081/example-vllm-model`.
+
+```json
+{
+  "settings": { "maxOutputTokens": 32768 },
+  "modelOptions": {
+    "example-vllm-model (127.0.0.1:8081)": { "maxTokens": 16384 },
+    "127.0.0.1:8081/other-model": { "maxTokens": 8192 }
+  }
+}
+```
+
+> **vLLM constraint** — vLLM rejects a request with HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`. Lower the per-model `maxTokens` cap instead of the global `settings.maxOutputTokens` when only one model needs the extra headroom; the global setting stays the fallback for all other models.
 
 ## Model ID Format
 

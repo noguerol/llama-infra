@@ -4,6 +4,7 @@ import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, SettingsList, type SettingItem, Text } from "@earendil-works/pi-tui";
 
 import {
+	clearModelMaxTokens,
 	DEFAULT_SETTINGS,
 	getConfigPath,
 	idSafeHost,
@@ -326,12 +327,14 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 	const config = shared.activeConfig!;
 	for (;;) {
 		const budgetCount = Object.values(modelOptions()).filter((o) => o.thinkingBudgets).length;
+		const capCount = Object.values(modelOptions()).filter((o) => o.maxTokens !== undefined).length;
 		const action = await selectFrom(ctx, "🦙 Configuration", [
 			{ value: "servers", label: "🌐 Servers", description: `${config.servers.filter((s) => s.enabled).length}/${config.servers.length} enabled` },
 			{ value: "scan", label: "🔍 Scan now", description: "rediscover models on all enabled servers" },
 			{ value: "models", label: "📋 Discovered models", description: `${shared.registeredCount} currently registered` },
 			{ value: "test", label: "🧪 Test connectivity", description: "probe every endpoint and show latency" },
 			{ value: "budgets", label: "🧠 Thinking budgets", description: `${budgetCount} model(s) with budgets` },
+			{ value: "outputCaps", label: "📏 Output caps", description: `${capCount} model(s) with a cap` },
 			{
 				value: "cost",
 				label: `💰 Energy cost: ${config.settings.costTracking ? "ON" : "OFF"}`,
@@ -364,6 +367,9 @@ export async function showConfigMenu(ctx: ExtensionContext, deps: UiDeps): Promi
 				break;
 			case "budgets":
 				await showThinkingBudgetsMenu(ctx, deps);
+				break;
+			case "outputCaps":
+				await showOutputCapsMenu(ctx, deps);
 				break;
 			case "cost":
 				await showCostMenu(ctx, deps);
@@ -742,6 +748,107 @@ async function editModelBudgets(ctx: ExtensionContext, modelId: string): Promise
 	}
 }
 
+// ── Per-model output cap ─────────────────────────────────
+function capSummary(v?: number): string {
+	if (v !== undefined) return `${v.toLocaleString()} tokens`;
+	const global = shared.activeConfig?.settings.maxOutputTokens;
+	return global !== undefined ? `— (global: ${global})` : "— (server default)";
+}
+
+async function showOutputCapsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
+	const config = shared.activeConfig!;
+	const models = shared.lastModels;
+	for (;;) {
+		const caps = Object.entries(modelOptions()).filter(([, o]) => o.maxTokens !== undefined);
+		const items: Array<{ value: string; label: string; description?: string }> = [];
+		for (const m of models) {
+			items.push({
+				value: m.id,
+				label: `📏 ${m.name}`,
+				description: `${capSummary(modelOptions()[m.id]?.maxTokens)} · ctx ${m.contextWindow.toLocaleString()}`,
+			});
+		}
+		for (const [id, opts] of caps) {
+			if (models.some((m) => m.id === id)) continue;
+			items.push({
+				value: id,
+				label: `📏 ${id}`,
+				description: `${capSummary(opts.maxTokens)} (not online)`,
+			});
+		}
+		if (items.length === 0) {
+			const info = await ctx.ui.confirm(
+				"📏 Output caps",
+				"No models discovered yet. Run /llama-infra scan first, then come back. Open help?",
+			);
+			if (info) showHelp(ctx);
+			return;
+		}
+		items.push({ value: "__back", label: "← Back", description: "" });
+		const picked = await selectFrom(ctx, "📏 Output cap — pick a model", items);
+		if (picked === undefined || picked === "__back") return;
+		const changed = await editModelMaxTokens(ctx, picked);
+		if (changed) {
+			saveConfig(config);
+			ctx.ui.notify("📏 Output cap saved — re-registering", "info");
+			await deps.rescan(ctx);
+		}
+	}
+}
+
+async function editModelMaxTokens(ctx: ExtensionContext, modelId: string): Promise<boolean> {
+	const config = shared.activeConfig!;
+	let changed = false;
+	for (;;) {
+		const opts = (modelOptions()[modelId] ??= {} as ModelOptions);
+		const current = opts.maxTokens;
+		const action = await selectFrom<number | string>(ctx, `📏 Output cap for ${modelId}`, [
+			...(current !== undefined
+				? [{ value: "clear", label: `🗑️ Clear cap (now ${current.toLocaleString()})`, description: "fall back to the server / global setting" }]
+				: []),
+			{ value: 1024, label: "1,024", description: "" },
+			{ value: 2048, label: "2,048", description: "" },
+			{ value: 4096, label: "4,096", description: "" },
+			{ value: 8192, label: "8,192", description: "" },
+			{ value: 16384, label: "16,384", description: "" },
+			{ value: 32768, label: "32,768", description: "" },
+			{ value: 65536, label: "65,536", description: "" },
+			{ value: "custom", label: "✏️ Custom value…", description: "enter any token count" },
+			{ value: "__back", label: "← Back", description: "" },
+		]);
+		if (action === undefined || action === "__back") {
+			if (Object.keys(opts).length === 0) delete config.modelOptions[modelId];
+			return changed;
+		}
+
+		if (action === "clear") {
+			// Removes only opts.maxTokens; the entry is dropped only if it becomes empty.
+			const removed = clearModelMaxTokens(modelId);
+			changed = changed || removed;
+			ctx.ui.notify(`🗑️ Output cap cleared for ${modelId}`, "info");
+			continue;
+		}
+
+		if (action === "custom") {
+			const raw = await ctx.ui.input("✏️ Custom output cap (tokens)", String(current ?? 32768));
+			if (raw === undefined) continue;
+			const parsed = parseInt(raw.trim(), 10);
+			if (isNaN(parsed) || parsed < 1) {
+				ctx.ui.notify("❌ Invalid token count", "error");
+				continue;
+			}
+			opts.maxTokens = parsed;
+			changed = true;
+			ctx.ui.notify(`📏 Output cap = ${parsed.toLocaleString()} (clamped to context on rescan)`, "info");
+			continue;
+		}
+
+		opts.maxTokens = action as number;
+		changed = true;
+		ctx.ui.notify(`📏 Output cap = ${(action as number).toLocaleString()}`, "info");
+	}
+}
+
 // ── Metrics menu ───────────────────────────────────────────────────────────
 async function showMetricsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<void> {
 	const config = shared.activeConfig!;
@@ -932,7 +1039,7 @@ async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<vo
 		{
 			id: "maxOutputTokens",
 			label: "Max output tokens",
-			description: "Ceiling sent as max_tokens for models that do not report their own limit. Raise it for longer generations.",
+			description: "Ceiling sent as max_tokens for models that do not report their own limit. Raise it for longer generations. Per-model overrides win: config → 📏 Output caps.",
 			currentValue: formatTokens(s.maxOutputTokens),
 			values: [4_096, 8_192, 16_384, 24_576, 32_768, 49_152, 65_536].map((v) => formatTokens(v)),
 		},

@@ -388,6 +388,18 @@ export function modelOptionsFor(rawId: string): ModelOptions | undefined {
 	return undefined;
 }
 
+/** Remove a per-model `maxTokens` override, preserving every other per-model
+ *  option (thinkingBudgets / vision / drafter). The `modelOptions` entry itself
+ *  is removed only when it becomes empty. Returns true when something changed. */
+export function clearModelMaxTokens(modelId: string): boolean {
+	const config = shared.activeConfig;
+	const opts = config?.modelOptions?.[modelId];
+	if (!config || !opts || opts.maxTokens === undefined) return false;
+	delete opts.maxTokens;
+	if (Object.keys(opts).length === 0) delete config.modelOptions[modelId];
+	return true;
+}
+
 /** Compact id registered in pi for a raw server model id (or the input). */
 export function compactIdFor(modelId: string | undefined): string | undefined {
 	if (!modelId) return undefined;
