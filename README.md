@@ -438,18 +438,20 @@ llama.cpp-family models are registered as reasoning models, exactly like a nativ
 When enabled, the speed reading appears in the footer's status line (no extra terminal row) whenever the active model is from llama-infra, updating constantly while tokens flow. Both entries are kept ultra-compact so they coexist with other extensions on pi's single status line (which truncates from the end):
 
 ```
-🦙(12) ⚡…            (before the first token)
+🦙(12) ⚡… 🔥…       (before the first measurement)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (while streaming)
-🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (just after the answer ends)
-🦙(12) ⏸             (between turns)
+🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (just after the answer ends — last rates kept)
+🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (between turns — last rates persisted)
 🦙(12) ▶2 ⚡ 150 t/s 🔥 18.0 t/s  (pi idle, server busy for other clients)
-🦙(12) ⏸ 💰3.2c      (energy cost of this session, after a turn)
+🦙(12) ⏸ 💰3.2c      (no rate measured yet; energy cost of this session)
 ```
 
 (`🦙(n)` is the extension's model-count status; both live on the same footer line, so no extra row is consumed.)
 
+The footer is **persistent**: llama-infra keeps the last measured prefill/generation rates on the status line instead of clearing them between requests or turns, so the footer stays stable during multi-step agent runs; it only shows the `⚡…`/`🔥…` placeholders before the first measurement and the idle `⏸` when no rate has ever been measured and the server is idle.
+
 - **Client measurement (always, no `--metrics` needed)** — prefill speed = `prompt tokens ÷ (request → first token)` (pi's `usage.input`, OpenAI-style `prompt_tokens` as fallback); generation speed = a moving 1.5 s window over per-token arrival samples. Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
-- **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown (`▶n`); when the server is idle, the plain `⏸` reading returns.
+- **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown (`▶n`); when the server is idle the last measured client rates stay on the line, and the plain `⏸` reading is only used when no rate has ever been measured.
 
 ## Energy Cost (💰)
 

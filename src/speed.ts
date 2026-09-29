@@ -135,60 +135,58 @@ export function createSpeedTracker(deps: SpeedDeps) {
 		const f = fg(ctx);
 		const parts: string[] = [];
 
-		switch (state) {
-			case "prefill":
-				parts.push(f("warning", "⚡…"));
-				break;
+		// The measured rates are the backbone: they persist across requests and
+		// turns so the footer never flickers back to placeholders once known.
+		// A live rate is only computed while a stream is actually running.
+		let live: number | undefined;
+		if (state === "streaming") {
+			live = genRateAt(now);
+			if (live !== undefined) lastGenTps = live;
+		}
+		const gen = live ?? lastGenTps;
 
-			case "streaming": {
-				// Prefill rate of the previous call (only known once it ended).
-				if (lastPrefillTps !== undefined) {
-					parts.push(f("muted", `⚡ ${Math.round(lastPrefillTps)} t/s`));
-				}
-				const gen = genRateAt(now);
-				if (gen !== undefined) {
-					lastGenTps = gen;
-					parts.push(f(rateColor(gen, "gen"), `🔥 ${formatRate(gen)} t/s`));
-				}
-				break;
-			}
+		// Prefill: show the persisted rate; the placeholder only before the very
+		// first measurement ever.
+		if (lastPrefillTps !== undefined) {
+			parts.push(f(rateColor(lastPrefillTps, "prefill"), `⚡ ${Math.round(lastPrefillTps)} t/s`));
+		} else if (state === "prefill") {
+			parts.push(f("warning", "⚡…"));
+		}
 
-			case "done": {
-				if (lastPrefillTps !== undefined) {
-					parts.push(f(rateColor(lastPrefillTps, "prefill"), `⚡ ${Math.round(lastPrefillTps)} t/s`));
-				}
-				if (lastGenTps !== undefined) {
-					parts.push(f(rateColor(lastGenTps, "gen"), `🔥 ${formatRate(lastGenTps)} t/s`));
-				}
-				break;
-			}
+		// Generation: same rule — persisted/live rate first, placeholder only
+		// while a stream is pending its first computable rate.
+		if (gen !== undefined) {
+			parts.push(f(rateColor(gen, "gen"), `🔥 ${formatRate(gen)} t/s`));
+		} else if (state === "prefill" || state === "streaming") {
+			parts.push(f("muted", "🔥…"));
+		}
 
-			case "idle": {
-				// Server supplement: this endpoint is busy for *other* clients.
-				if (server && server.processing > 0) {
-					parts.push(f("success", `▶${server.processing}`));
-					if (server.promptTps !== undefined && server.promptTps > 0) {
-						parts.push(f(rateColor(server.promptTps, "prefill"), `⚡ ${Math.round(server.promptTps)} t/s`));
-					}
-					if (server.genTps !== undefined && server.genTps > 0) {
-						parts.push(f(rateColor(server.genTps, "gen"), `🔥 ${formatRate(server.genTps)} t/s`));
-					}
-					// vLLM extras: drafter acceptance + prefix-cache reuse (lifetime ratios).
-					if (server.specAcceptRate !== undefined && server.specAcceptRate > 0) {
-						parts.push(f("muted", `🎯 ${Math.round(server.specAcceptRate * 100)}%`));
-					}
-					if (server.prefixCacheHitRate !== undefined && server.prefixCacheHitRate > 0) {
-						parts.push(f("muted", `♻️ ${Math.round(server.prefixCacheHitRate * 100)}%`));
-					}
-				} else {
-					parts.push(f("muted", "⏸"));
+		// Idle keeps the measured rates and supplements with server-side activity
+		// from *other* clients. The paused icon only appears when there is
+		// neither a rate nor server activity to show.
+		if (state === "idle") {
+			if (server && server.processing > 0) {
+				parts.push(f("success", `▶${server.processing}`));
+				if (server.promptTps !== undefined && server.promptTps > 0) {
+					parts.push(f(rateColor(server.promptTps, "prefill"), `⚡ ${Math.round(server.promptTps)} t/s`));
 				}
-				break;
+				if (server.genTps !== undefined && server.genTps > 0) {
+					parts.push(f(rateColor(server.genTps, "gen"), `🔥 ${formatRate(server.genTps)} t/s`));
+				}
+				// vLLM extras: drafter acceptance + prefix-cache reuse (lifetime ratios).
+				if (server.specAcceptRate !== undefined && server.specAcceptRate > 0) {
+					parts.push(f("muted", `🎯 ${Math.round(server.specAcceptRate * 100)}%`));
+				}
+				if (server.prefixCacheHitRate !== undefined && server.prefixCacheHitRate > 0) {
+					parts.push(f("muted", `♻️ ${Math.round(server.prefixCacheHitRate * 100)}%`));
+				}
+			} else if (parts.length === 0) {
+				parts.push(f("muted", "⏸"));
 			}
 		}
 
-		// A stream is live but no rate is computable yet (first ~300 ms of a call).
-		if (parts.length === 0) parts.push(f("muted", "🔥…"));
+		// Nothing measurable yet (fresh idle session).
+		if (parts.length === 0) parts.push(f("muted", "⏸"));
 		return parts.join(" ");
 	}
 
@@ -227,7 +225,6 @@ export function createSpeedTracker(deps: SpeedDeps) {
 			firstTokenAt = undefined;
 			tokenCount = 0;
 			samples = [{ ts: at, n: 0 }];
-			lastGenTps = undefined;
 			render(ctx, at, true);
 		},
 
@@ -294,7 +291,6 @@ export function createSpeedTracker(deps: SpeedDeps) {
 			state = "idle";
 			tokenCount = 0;
 			samples = [];
-			lastGenTps = undefined;
 			render(ctx, Date.now(), true);
 		},
 

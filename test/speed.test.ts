@@ -48,7 +48,7 @@ console.log("speed tracker: basic turn lifecycle");
 	});
 
 	tracker.onRequest(ctx, 0);
-	check("prefill line before first token", lines.join() === "⚡…", lines.join());
+	check("prefill line shows placeholders before first token", lines.join() === "⚡… 🔥…", lines.join());
 
 	// First token at t=2000 → streaming. No rate yet (window span < 300 ms).
 	tracker.onToken(ctx, delta(1), 2000);
@@ -67,15 +67,20 @@ console.log("speed tracker: basic turn lifecycle");
 	check("done line keeps gen + prefill rates", /🔥 .*t\/s/.test(done) && /⚡ 1500 t\/s/.test(done), done);
 
 	tracker.onTurnEnd(ctx);
-	check("idle line after turn end", lines.join() === "⏸", lines.join());
+	// Rates persist across turns so the footer does not flicker back to idle.
+	check(
+		"idle line keeps measured rates after turn end",
+		/🔥 [\d.]+ t\/s/.test(lines.join()) && /⚡ 1500 t\/s/.test(lines.join()),
+		lines.join(),
+	);
 
-	// Server supplement while idle: other clients busy.
+	// Server supplement while idle: other clients busy (appended to the rates).
 	tracker.onServerState(ctx, { processing: 2, promptTps: 150, genTps: 18 } satisfies ServerMetricsState);
 	const sup = lines.join();
 	check("server supplement shown while idle", /▶2/.test(sup) && /⚡ 150 t\/s/.test(sup) && /🔥 18\.0 t\/s/.test(sup), sup);
 
 	tracker.onServerState(ctx, null);
-	check("back to plain idle", lines.join() === "⏸", lines.join());
+	check("idle without server keeps rates", /🔥 [\d.]+ t\/s/.test(lines.join()) && !/⏸/.test(lines.join()), lines.join());
 }
 
 console.log("speed tracker: foreign model");
@@ -157,7 +162,7 @@ console.log("speed tracker: dedup (no redundant status updates)");
 		isOurs: (c) => c?.model?.provider === "llama-infra",
 		enabled: () => true,
 	});
-	tracker.onRequest(ctxDup, 0); // "⚡…" → 1 update
+	tracker.onRequest(ctxDup, 0); // "⚡… 🔥…" → 1 update
 	tracker.onRequest(ctxDup, 1000); // identical text, forced render → dedup skips
 	check("identical prefill text sent once", updates === 1, `updates=${updates}`);
 	tracker.onToken(ctxDup, delta(1), 1500); // streaming → different text
