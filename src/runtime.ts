@@ -143,6 +143,7 @@ const IMAGE_TOKEN_COST = 1024;
 
 interface PromptEstimate {
 	chars: number;
+	toolsChars: number;
 	images: number;
 }
 
@@ -174,23 +175,25 @@ function walkPrompt(value: unknown, acc: PromptEstimate): void {
 /**
  * Rough prompt-size estimate in tokens for an OpenAI-compatible request.
  *
- * Heuristic: text chars / 4, plus a flat cost per image part, plus a fixed
- * 256-token overhead for chat framing / role markers.
+ * Heuristic: text chars / 4, tool-schema JSON chars / 3.5 (tool JSON
+ * tokenizes denser than plain prose — names/keys/punctuation), plus a flat
+ * cost per image part, plus a fixed 256-token overhead for chat framing /
+ * role markers.
  */
 export function estimatePromptTokens(payload: Record<string, unknown>): number {
-	const acc: PromptEstimate = { chars: 0, images: 0 };
+	const acc: PromptEstimate = { chars: 0, toolsChars: 0, images: 0 };
 	walkPrompt(payload.messages, acc);
 	walkPrompt(payload.system, acc);
 	walkPrompt(payload.prompt, acc);
 	const tools = payload.tools;
 	if (tools !== undefined) {
 		try {
-			acc.chars += JSON.stringify(tools).length;
+			acc.toolsChars += JSON.stringify(tools).length;
 		} catch {
 			// Non-serializable tools (cycles) — ignore rather than throw at request time.
 		}
 	}
-	return Math.ceil(acc.chars / 4) + acc.images * IMAGE_TOKEN_COST + 256;
+	return Math.ceil(acc.chars / 4) + Math.ceil(acc.toolsChars / 3.5) + acc.images * IMAGE_TOKEN_COST + 256;
 }
 
 /**
@@ -213,13 +216,62 @@ export function clampMaxTokensToFit(
 	return next < current ? next : undefined;
 }
 
+/**
+ * Wrap pi's own `onPayload` hook so the tools-aware clamp always runs on the
+ * exact final request params.
+ *
+ * pi-ai invokes `onPayload` with the fully-composed request body (including
+ * tool schemas) right before it is sent, so clamping here also covers nested
+ * `ctx.modelRegistry.streamSimple()` calls, which bypass the
+ * `before_provider_request` plugin hook entirely.
+ *
+ * `prev` (pi's own handler, e.g. id rewrite / thinking budget) runs first and
+ * its returned params are adopted when not null/undefined; the clamp is then
+ * applied on top of those params. Invalid inputs leave params untouched.
+ */
+export function composeOnPayload(
+	prev: ((params: any, model: any) => unknown) | undefined,
+	contextWindow: number | undefined,
+): (params: any, model: any) => Promise<any> {
+	return async (params: any, model: any) => {
+		let effective = params;
+		if (typeof prev === "function") {
+			const updated = await prev(params, model);
+			if (updated !== null && updated !== undefined) effective = updated;
+		}
+		if (
+			typeof contextWindow === "number" &&
+			Number.isFinite(contextWindow) &&
+			contextWindow > 0 &&
+			effective !== null &&
+			typeof effective === "object"
+		) {
+			const clamped = clampMaxTokensToFit(effective as Record<string, unknown>, contextWindow);
+			if (clamped !== undefined) return { ...effective, max_tokens: clamped };
+		}
+		return effective;
+	};
+}
+
 export function createLongTimeoutOpenAICompletionsStream(model: any, context: any, options?: Record<string, any>) {
 	const out = new ForwardedAssistantMessageEventStream();
 	void (async () => {
 		try {
 			const streamSimple = await loadOpenAICompletionsStreamSimple();
 			const requestModel = toServerRequestModel(model);
-			const inner = streamSimple(requestModel, context, withLocalRuntimeDefaults(options, activeRequestTimeoutMs()));
+			// pi-ai calls `onPayload` with the FINAL request body (tool schemas
+			// included), so clamping there covers both normal turns and nested
+			// ctx.modelRegistry.streamSimple() calls, which bypass the
+			// before_provider_request plugin hook.
+			const contextWindow = typeof model?.contextWindow === "number" ? model.contextWindow : undefined;
+			const inner = streamSimple(
+				requestModel,
+				context,
+				withLocalRuntimeDefaults(
+					{ ...options, onPayload: composeOnPayload(options?.onPayload, contextWindow) },
+					activeRequestTimeoutMs(),
+				),
+			);
 			for await (const event of inner) out.push(event);
 			if (typeof inner.result === "function") out.end(await inner.result());
 			else out.end();

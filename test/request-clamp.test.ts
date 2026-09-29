@@ -4,6 +4,7 @@
 import {
 	REQUEST_SAFETY_TOKENS,
 	clampMaxTokensToFit,
+	composeOnPayload,
 	estimatePromptTokens,
 } from "../src/runtime.ts";
 
@@ -41,9 +42,9 @@ const toolsJsonChars = JSON.stringify(bigTools).length;
 const withToolsEstimate = estimatePromptTokens({ ...baseMessages, tools: bigTools });
 const toolsDelta = withToolsEstimate - estimatePromptTokens(baseMessages);
 check(
-	"adding a large tools array raises the estimate by ≈JSON chars/4",
-	Math.abs(toolsDelta - toolsJsonChars / 4) <= 2,
-	`delta=${toolsDelta} json/4=${toolsJsonChars / 4}`,
+	"adding a large tools array raises the estimate by ≈JSON chars/3.5",
+	Math.abs(toolsDelta - Math.ceil(toolsJsonChars / 3.5)) <= 2,
+	`delta=${toolsDelta} json/3.5=${Math.ceil(toolsJsonChars / 3.5)}`,
 );
 
 const imageMessage = {
@@ -128,8 +129,94 @@ check(
 	clampMaxTokensToFit({ ...baseMessages, max_tokens: 1000 }, 0) === undefined,
 );
 
-if (failures > 0) {
-	console.error(`request-clamp tests failed: ${failures}`);
-	process.exit(1);
-}
-console.log("request-clamp tests passed");
+// ── composeOnPayload ──────────────────────────────────────────────────────
+// pi-ai calls onPayload with the final request body (tool schemas included),
+// so this wrapper must preserve pi's own onPayload and clamp on top of it.
+
+const clampCtx = 20_000;
+const clampModel = { id: "test-model", contextWindow: clampCtx };
+const needsClamp = () => ({ messages: [{ role: "user", content: "x".repeat(40_000) }], max_tokens: 20_000 });
+const fits = () => ({ messages: [{ role: "user", content: "hello world" }] });
+
+void (async () => {
+	// 1. no prev -> clamps.
+	{
+		const p = needsClamp();
+		const est = estimatePromptTokens(p);
+		const out = await composeOnPayload(undefined, clampCtx)(p, clampModel);
+		check(
+			"composeOnPayload: no prev clamps max_tokens",
+			typeof out.max_tokens === "number" && out.max_tokens < p.max_tokens,
+			String(out.max_tokens),
+		);
+		check(
+			"composeOnPayload: clamped result satisfies est + next + safety <= ctx",
+			est + out.max_tokens + REQUEST_SAFETY_TOKENS <= clampCtx,
+			`est=${est} next=${out.max_tokens}`,
+		);
+	}
+
+	// 2. prev rewrites the model and returns params -> rewrite preserved AND clamped.
+	{
+		const p = needsClamp();
+		const prev = async (params: any) => ({ ...params, model: "rewritten-model" });
+		const out = await composeOnPayload(prev, clampCtx)(p, clampModel);
+		check("composeOnPayload: prev model rewrite preserved", out.model === "rewritten-model", String(out.model));
+		check(
+			"composeOnPayload: prev rewrite plus clamped max_tokens",
+			typeof out.max_tokens === "number" && out.max_tokens < 20_000 && out !== p,
+			String(out.max_tokens),
+		);
+		check("composeOnPayload: original params not mutated", p.max_tokens === 20_000 && p.model === undefined);
+	}
+
+	// 3. prev returns undefined -> original params clamped.
+	{
+		const p = needsClamp();
+		const out = await composeOnPayload(async () => undefined, clampCtx)(p, clampModel);
+		check(
+			"composeOnPayload: prev undefined falls back to original params, still clamped",
+			typeof out.max_tokens === "number" && out.max_tokens < 20_000 && out.messages === p.messages,
+			String(out.max_tokens),
+		);
+	}
+
+	// 4. missing / non-finite contextWindow -> unchanged.
+	{
+		const p = needsClamp();
+		const out = await composeOnPayload(undefined, undefined)(p, clampModel);
+		check("composeOnPayload: undefined contextWindow leaves params unchanged", out.max_tokens === 20_000 && out === p);
+		const outNan = await composeOnPayload(undefined, Number.NaN)(p, clampModel);
+		check("composeOnPayload: non-finite contextWindow leaves params unchanged", outNan.max_tokens === 20_000 && outNan === p);
+		const outNull = await composeOnPayload(undefined, clampCtx)(null, clampModel);
+		check("composeOnPayload: null params returned unchanged (no throw)", outNull === null);
+		const outPrimitive = await composeOnPayload(undefined, clampCtx)("str", clampModel);
+		check("composeOnPayload: primitive params returned unchanged (no throw)", outPrimitive === "str");
+	}
+
+	// 5. already-fitting prompt -> unchanged, no max_tokens injected when absent.
+	{
+		const p = fits();
+		const out = await composeOnPayload(undefined, 100_000)(p, { id: "m", contextWindow: 100_000 });
+		check("composeOnPayload: fitting prompt with no max_tokens -> no key injected", out === p && !("max_tokens" in out));
+	}
+
+	// 6. async prev is awaited.
+	{
+		const p = needsClamp();
+		const prev = (params: any) => new Promise((resolve) => setTimeout(() => resolve({ ...params, model: "from-async" }), 5));
+		const out = await composeOnPayload(prev, clampCtx)(p, clampModel);
+		check("composeOnPayload: async prev awaited and its result adopted", out.model === "from-async", String(out.model));
+		check(
+			"composeOnPayload: async prev result still clamped",
+			typeof out.max_tokens === "number" && out.max_tokens < 20_000,
+			String(out.max_tokens),
+		);
+	}
+
+	if (failures > 0) {
+		console.error(`request-clamp tests failed: ${failures}`);
+		process.exit(1);
+	}
+	console.log("request-clamp tests passed");
+})();
