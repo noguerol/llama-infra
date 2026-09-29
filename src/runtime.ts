@@ -126,6 +126,93 @@ export function toServerRequestModel<T extends { id?: string }>(
 	return raw !== undefined && raw !== id ? { ...model, id: raw } : model;
 }
 
+// ── Request-time max_tokens clamp ─────────────────────────────────────────
+//
+// pi's own `estimateContextTokens` is tokenizer-exact for the chat text but
+// ignores tool schemas entirely. On tool-heavy setups those schemas can add
+// tens of thousands of tokens, so pi happily sends a request whose
+// prompt + max_tokens exceeds the served context window. Strict engines (vLLM)
+// answer HTTP 400 in that case. The estimate + clamp below keep
+// `prompt + max_tokens + REQUEST_SAFETY_TOKENS <= contextWindow`.
+
+/** Extra tokens reserved for response overhead and estimation error. */
+export const REQUEST_SAFETY_TOKENS = 4096;
+
+/** Flat token cost charged per image part (base64 data is never counted). */
+const IMAGE_TOKEN_COST = 1024;
+
+interface PromptEstimate {
+	chars: number;
+	images: number;
+}
+
+/**
+ * Recursively walk a payload fragment, counting text characters and image
+ * parts. Image objects (whose `type` is an image marker) are counted and NOT
+ * recursed, so multi-megabyte base64 data URLs never inflate the estimate.
+ */
+function walkPrompt(value: unknown, acc: PromptEstimate): void {
+	if (typeof value === "string") {
+		acc.chars += value.length;
+		return;
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) walkPrompt(item, acc);
+		return;
+	}
+	if (value !== null && typeof value === "object") {
+		const record = value as Record<string, unknown>;
+		const type = record.type;
+		if (type === "image" || type === "image_url" || type === "input_image") {
+			acc.images += 1;
+			return;
+		}
+		for (const item of Object.values(record)) walkPrompt(item, acc);
+	}
+}
+
+/**
+ * Rough prompt-size estimate in tokens for an OpenAI-compatible request.
+ *
+ * Heuristic: text chars / 4, plus a flat cost per image part, plus a fixed
+ * 256-token overhead for chat framing / role markers.
+ */
+export function estimatePromptTokens(payload: Record<string, unknown>): number {
+	const acc: PromptEstimate = { chars: 0, images: 0 };
+	walkPrompt(payload.messages, acc);
+	walkPrompt(payload.system, acc);
+	walkPrompt(payload.prompt, acc);
+	const tools = payload.tools;
+	if (tools !== undefined) {
+		try {
+			acc.chars += JSON.stringify(tools).length;
+		} catch {
+			// Non-serializable tools (cycles) — ignore rather than throw at request time.
+		}
+	}
+	return Math.ceil(acc.chars / 4) + acc.images * IMAGE_TOKEN_COST + 256;
+}
+
+/**
+ * Clamp a request's `max_tokens` so the estimated prompt plus the requested
+ * output plus REQUEST_SAFETY_TOKENS still fit in the model context window.
+ *
+ * Returns the clamped value only when it is strictly smaller than the current
+ * `max_tokens` (never increases, never forces a value when none was set);
+ * otherwise returns undefined so the caller leaves the payload untouched.
+ */
+export function clampMaxTokensToFit(
+	payload: Record<string, unknown>,
+	contextWindow: number,
+): number | undefined {
+	const current = payload.max_tokens;
+	if (typeof current !== "number" || !Number.isFinite(current)) return undefined;
+	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
+	const available = Math.floor(contextWindow - estimatePromptTokens(payload) - REQUEST_SAFETY_TOKENS);
+	const next = Math.max(1, Math.min(current, available));
+	return next < current ? next : undefined;
+}
+
 export function createLongTimeoutOpenAICompletionsStream(model: any, context: any, options?: Record<string, any>) {
 	const out = new ForwardedAssistantMessageEventStream();
 	void (async () => {

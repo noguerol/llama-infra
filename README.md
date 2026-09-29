@@ -155,6 +155,8 @@ The resolver accepts both forms (raw id, registered display id, and the legacy `
 - The server enforces a hard limit and returns HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`; a correct `contextWindow` keeps pi's compaction predictable. When only one model needs a lower generation cap, set `modelOptions[id].maxTokens` (see [Per-model output cap](#per-model-output-cap-maxtokens)) instead of lowering the global `settings.maxOutputTokens`.
 - This particular server does not validate types (e.g. `enable_thinking: "false"` is accepted); pi always sends proper booleans.
 
+**Tools-aware request clamp** — llama-infra now recomputes `max_tokens` on every provider request in a `before_provider_request` hook. It estimates the full payload — messages plus tool schemas, counting images at a fixed cost and skipping base64 data — and reserves `4096` tokens, so pi's tools-blind `estimateContextTokens()` can no longer let a tools-heavy request overflow the served context. The per-model `modelOptions[id].maxTokens` remains the **ceiling**: this clamp only lowers `max_tokens` when the estimated prompt requires the headroom, and never raises it above the configured cap. **Limitation:** nested calls made through `ctx.modelRegistry.streamSimple()` bypass `before_provider_request`, so the clamp applies to normal turns only.
+
 **Ready-to-paste `~/.pi/agent/llama-infra.json`**
 
 ```json

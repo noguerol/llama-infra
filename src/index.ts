@@ -22,7 +22,7 @@ import {
 	shared,
 	thinkingBudgetField,
 } from "./core.ts";
-import { createLongTimeoutOpenAICompletionsStream } from "./runtime.ts";
+import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
 import { resolveCostProfile } from "./cost.ts";
 import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
 export { modelOptionsFor };
@@ -386,6 +386,28 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("turn_end", (_event, ctx) => {
 		speedApi?.onTurnEnd(ctx);
+	});
+
+	// ── Hook -1: tools-aware request-time max_tokens clamp ────────────────
+	// pi's estimateContextTokens ignores tool schemas, which on tool-heavy
+	// setups add tens of thousands of tokens. strict engines (vLLM) answer
+	// HTTP 400 when prompt + max_tokens exceeds max_model_len, so clamp the
+	// request before the compact→raw id rewrite (Hook 0) turns the payload
+	// model into the raw id: this sees the compact id registered in pi.
+	pi.on("before_provider_request", (event, _ctx) => {
+		const payload = event.payload as Record<string, unknown>;
+		const modelId = typeof payload.model === "string" ? payload.model : undefined;
+		if (!modelId) return undefined;
+		const compact = compactIdFor(modelId);
+		const model = compact ? shared.lastModels.find((m) => m.id === compact) : undefined;
+		if (!model) return undefined;
+		const est = estimatePromptTokens(payload);
+		const next = clampMaxTokensToFit(payload, model.contextWindow);
+		if (next === undefined) return undefined;
+		debugLog(
+			`max_tokens clamp ${payload.max_tokens} → ${next} (prompt ~${est} tok, ctx ${model.contextWindow})`,
+		);
+		return { ...payload, max_tokens: next };
 	});
 
 	// ── Hook 0: compact id → raw server model id ──────────────────────────
