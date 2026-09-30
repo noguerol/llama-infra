@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-09-30
+
+### Added
+
+- Per-server `protocol` setting (`http`/`https`, default `http`) so llama.cpp servers proxied behind TLS (Tailscale serve, Caddy, …) can be discovered and used: discovery, metrics polling, header warmup and chat requests all follow the configured scheme. Editable in the 🌐 Servers menu (🔒 Protocol toggle) and offered when adding a server. Only public CA-issued certificates are supported — self-signed certificates are not supported. TLS handshake/verification failures are classified as network errors so endpoints report them cleanly instead of falling through to the ds4 probe.
+
+### Tests
+
+- `test/protocol.test.ts`
+
 ## [1.6.3] - 2026-09-29
 
 ### Fixed

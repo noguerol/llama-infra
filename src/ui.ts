@@ -420,7 +420,7 @@ async function showServersMenu(ctx: ExtensionContext, deps: UiDeps): Promise<voi
 			items.push({
 				value: srv.id,
 				label: `${state} ${serverLabel(srv)}`,
-				description: `${srv.host} · ${srv.ports.length} port(s)${srv.enabled ? ` · ${models} model(s)` : " · disabled"}`,
+				description: `${srv.protocol === "https" ? "https://" : "http://"}${srv.host} · ${srv.ports.length} port(s)${srv.enabled ? ` · ${models} model(s)` : " · disabled"}`,
 			});
 		}
 		items.push({ value: "__add", label: "➕ Add server", description: "register a new machine" });
@@ -443,6 +443,11 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 		const state = !srv.enabled ? "⛔ disabled" : isServerUp(srv.id) ? "🟢 online" : "🔴 offline";
 		const action = await selectFrom(ctx, `🖥️ ${serverLabel(srv)} — ${srv.host} · ${state}`, [
 			{ value: "host", label: "✏️ Change host", description: `currently: ${srv.host}` },
+			{
+				value: "protocol",
+				label: `🔒 Protocol: ${srv.protocol === "https" ? "https" : "http"}`,
+				description: srv.protocol === "https" ? "TLS (server proxied behind HTTPS)" : "plaintext HTTP",
+			},
 			{ value: "label", label: "🏷️ Change label", description: `currently: ${serverLabel(srv)}` },
 			{ value: "ports", label: "🔌 Edit ports", description: `currently: ${srv.ports.join(", ")}` },
 			{
@@ -492,6 +497,13 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				srv.host = trimmed;
 				saveConfig(config);
 				ctx.ui.notify(`✅ Host updated: ${srv.host}`, "info");
+				await deps.rescan(ctx);
+				break;
+			}
+			case "protocol": {
+				srv.protocol = srv.protocol === "https" ? "http" : "https";
+				saveConfig(config);
+				ctx.ui.notify(`🔒 ${serverLabel(srv)} now uses ${srv.protocol}`, "info");
 				await deps.rescan(ctx);
 				break;
 			}
@@ -627,12 +639,24 @@ async function addServerFlow(ctx: ExtensionContext, deps: UiDeps): Promise<void>
 		"🕵️ ds4 (DwarfStar) probe?",
 		"Enable the chat-completions ping probe for this machine? (for DwarfStar/ds4 hosts)",
 	);
+	const useHttps = await ctx.ui.confirm(
+		"🔒 HTTPS?",
+		"Is this machine proxied behind TLS (https://)? Leave off for plain HTTP.",
+	);
 
 	let id = idSafeHost(trimmedHost).replace(/[^a-z0-9.-]/g, "-");
 	let n = 2;
 	while (config.servers.some((s) => s.id === id)) id = `${idSafeHost(trimmedHost).replace(/[^a-z0-9.-]/g, "-")}-${n++}`;
 
-	config.servers.push({ id, host: trimmedHost, label: label.trim() || undefined, ports, enabled: true, probeDs4 });
+	config.servers.push({
+		id,
+		host: trimmedHost,
+		label: label.trim() || undefined,
+		ports,
+		enabled: true,
+		probeDs4,
+		...(useHttps ? { protocol: "https" as const } : {}),
+	});
 	saveConfig(config);
 	ctx.ui.notify(`➕ Server added: ${label.trim() || trimmedHost} (${trimmedHost}) — ports ${ports.join(", ")}`, "info");
 	await deps.rescan(ctx);

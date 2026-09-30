@@ -110,7 +110,7 @@ export function serversShareEndpoint(
 	return b.ports.some((p) => aPorts.has(p));
 }
 
-function normalizeServer(s: Record<string, unknown>): import("./types.ts").ServerConfig {
+export function normalizeServer(s: Record<string, unknown>): import("./types.ts").ServerConfig {
 	return {
 		id: String(s.id ?? "local"),
 		host: String(s.host ?? "127.0.0.1"),
@@ -119,6 +119,7 @@ function normalizeServer(s: Record<string, unknown>): import("./types.ts").Serve
 		enabled: typeof s.enabled === "boolean" ? s.enabled : true,
 		...(s.probeDs4 === true ? { probeDs4: true } : {}),
 		...(typeof s.apiKey === "string" && s.apiKey ? { apiKey: s.apiKey } : {}),
+		...(s.protocol === "https" ? { protocol: "https" as const } : s.protocol === "http" ? { protocol: "http" as const } : {}),
 		...(() => {
 			const p = parseCostProfile(s.costProfile);
 			return p ? { costProfile: p } : {};
@@ -431,6 +432,11 @@ export function normalizeLevel(level: string | undefined): "minimal" | "low" | "
 // ── Server-label / id helpers ──────────────────────────────────────────────
 export function serverLabel(srv: ServerConfig): string {
 	return srv.label?.trim() || srv.host;
+}
+
+/** Base URL for one endpoint of a server, honoring its protocol (default http). */
+export function serverBaseUrl(srv: Pick<ServerConfig, "host" | "protocol">, port: number): string {
+	return `${srv.protocol === "https" ? "https" : "http"}://${srv.host}:${port}/v1`;
 }
 
 export function idSafeHost(host: string): string {

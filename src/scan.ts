@@ -3,8 +3,9 @@
 // module-level (no shared closure) — easy to lazy-load.
 
 import * as http from "node:http";
+import * as https from "node:https";
 import { readFileSync, readdirSync } from "node:fs";
-import { baseName, isLocalHost, modelOptionsFor, serverLabel, shared } from "./core.ts";
+import { baseName, isLocalHost, modelOptionsFor, serverBaseUrl, serverLabel, shared } from "./core.ts";
 import type {
 	EndpointResult,
 	HttpResult,
@@ -167,6 +168,8 @@ function httpRequest(
 ): Promise<HttpResult> {
 	return new Promise((resolve, reject) => {
 		const parsed = new URL(url);
+		const isHttps = parsed.protocol === "https:";
+		const mod = isHttps ? https : http;
 		const headers: http.OutgoingHttpHeaders = {
 			Accept: "application/json, text/plain",
 			"User-Agent": "pi-llama-infra/1.0",
@@ -178,16 +181,16 @@ function httpRequest(
 		}
 		const options: http.RequestOptions = {
 			hostname: parsed.hostname,
-			port: parsed.port || 80,
+			port: parsed.port || (isHttps ? 443 : 80),
 			path: parsed.pathname + parsed.search,
 			method,
 			headers,
 			timeout: timeoutMs,
 			family: 4,
-			agent: new http.Agent({ keepAlive: false, maxSockets: 1 }),
+			agent: new (isHttps ? https.Agent : http.Agent)({ keepAlive: false, maxSockets: 1 }),
 		};
 
-		const req = http.request(options, (res) => {
+		const req = mod.request(options, (res) => {
 			const chunks: Buffer[] = [];
 			res.on("data", (chunk: Buffer) => chunks.push(chunk));
 			res.on("end", () =>
@@ -222,7 +225,7 @@ export async function httpGet(url: string, timeoutMs: number, apiKey?: string): 
 }
 
 export function isNetworkError(msg: string): boolean {
-	return /timeout|socket hang up|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH/i.test(msg);
+	return /timeout|socket hang up|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPROTO|ERR_SSL|ERR_TLS|SELF_SIGNED|CERT_HAS_EXPIRED|UNABLE_TO_VERIFY|DEPTH_ZERO|wrong version number|unable to verify|self[- ]signed|certificate/i.test(msg);
 }
 
 // ── Model display names ────────────────────────────────────────────────────
@@ -537,7 +540,7 @@ export async function fetchModelsFromEndpoint(
 	settings: SettingsConfig,
 	localServers: Map<number, LocalServerInfo>,
 ): Promise<EndpointResult> {
-	const baseUrl = `http://${srv.host}:${port}/v1`;
+	const baseUrl = serverBaseUrl(srv, port);
 	const ep: EndpointResult = {
 		serverId: srv.id,
 		host: srv.host,
