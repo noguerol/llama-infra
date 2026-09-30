@@ -258,7 +258,7 @@ check("provider streamSimple still wired", typeof registeredProvider?.streamSimp
 console.log("vllm: raw id that already carries the (host:port) tag");
 
 const configTagged: InfraConfig = {
-	servers: [{ id: "bruma-2", host: "bruma", ports: [8082], enabled: true }],
+	servers: [{ id: "gpu-host", host: "gpu-host", ports: [8000], enabled: true }],
 	settings: { ...DEFAULT_SETTINGS },
 	modelOptions: {},
 };
@@ -270,10 +270,10 @@ const scanTagged: ScanResult = {
 	endpoints: [
 		{
 			ok: true,
-			serverId: "bruma-2",
-			label: "bruma 7900xtx",
-			host: "bruma",
-			port: 8082,
+			serverId: "gpu-host",
+			label: "gpu-host 8000",
+			host: "gpu-host",
+			port: 8000,
 			baseUrl: "http://gpu-host:8000/v1",
 			server: "vllm",
 			mode: "single",
@@ -342,17 +342,17 @@ const scanCase: ScanResult = {
 	endpoints: [
 		{
 			ok: true,
-			serverId: "bruma-2",
-			label: "bruma 7900xtx",
-			host: "bruma",
-			port: 8082,
+			serverId: "gpu-host",
+			label: "gpu-host 8000",
+			host: "gpu-host",
+			port: 8000,
 			baseUrl: "http://gpu-host:8000/v1",
 			server: "vllm",
 			mode: "single",
 			latencyMs: 1,
 			models: [
 				{
-					id: "Example-27B (BRUMA:8082)",
+					id: "Example-27B (GPU-HOST:8000)",
 					object: "model",
 					owned_by: "vllm",
 					max_model_len: 115000,
@@ -366,12 +366,12 @@ const scanCase: ScanResult = {
 const caseModels = buildAndRegisterProvider(pi, scanCase, configTagged, { persistCache: false });
 check(
 	"uppercase tag is recognized (no double-tagging)",
-	caseModels[0]?.id === "Example-27B (BRUMA:8082)",
+	caseModels[0]?.id === "Example-27B (GPU-HOST:8000)",
 	caseModels[0]?.id,
 );
 check(
 	"serverModelId stays the raw id for a case-differing tag",
-	caseModels[0]?.serverModelId === "Example-27B (BRUMA:8082)",
+	caseModels[0]?.serverModelId === "Example-27B (GPU-HOST:8000)",
 	caseModels[0]?.serverModelId,
 );
 

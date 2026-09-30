@@ -9,11 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Per-server `protocol` setting (`http`/`https`, default `http`) so llama.cpp servers proxied behind TLS (Tailscale serve, Caddy, …) can be discovered and used: discovery, metrics polling, header warmup and chat requests all follow the configured scheme. Editable in the 🌐 Servers menu (🔒 Protocol toggle) and offered when adding a server. Only public CA-issued certificates are supported — self-signed certificates are not supported. TLS handshake/verification failures are classified as network errors so endpoints report them cleanly instead of falling through to the ds4 probe.
+- Per-model `modelOptions[id].thinkingBudgetField` to override the top-level request field that carries the thinking budget, plus a **🔤 Budget field** entry in the `🧠 Thinking budgets` config menu. Use it to force vLLM's `thinking_token_budget` on a server whose kind cannot be detected (renamed wrapper, remote SGLang/TGI).
+
+### Fixed
+
+- vLLM **silently ignored** llama.cpp's `thinking_budget_tokens` (the name pi puts on the payload by default), so changing the thinking level looked like a no-op. llama-infra now renames that field to the engine's field (`thinking_token_budget` on vLLM) inside the `before_provider_request` hook, and `makeCompat()` exposes the right `thinkingTokenBudgetField` per server kind — including the per-model override — so pi sends the correct field directly.
+- `test/vllm.test.ts` tag regression: the fixture mixed a server host of `bruma:8082` with a model id embedding `gpu-host:8000`, so the double-tag assertions could never pass; the fixture now matches the implementation.
 
 ### Tests
 
-- `test/protocol.test.ts`
+- `test/vllm-thinking.test.ts`
 
 ## [1.6.3] - 2026-09-29
 
@@ -63,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `test/outputcaps.test.ts`
 - `test/vllm-vision.test.ts`
 
+[1.7.0]: https://github.com/noguerol/llama-infra/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/noguerol/llama-infra/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/noguerol/llama-infra/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/noguerol/llama-infra/compare/v1.6.0...v1.6.1

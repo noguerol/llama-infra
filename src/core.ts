@@ -274,7 +274,7 @@ export function loadModelsCache(): import("./types.ts").PiModel[] | null {
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: c.contextWindow,
 			maxTokens: c.maxTokens,
-			compat: makeCompat(c.endpoint?.kind),
+			compat: makeCompat(c.endpoint?.kind, modelOptionsFor(c.serverModelId || c.id)?.thinkingBudgetField),
 			serverModelId: c.serverModelId,
 			endpoint: c.endpoint,
 			thinkingBudgets: c.thinkingBudgets,
@@ -323,9 +323,43 @@ export function thinkingBudgetField(
 	return undefined;
 }
 
-export function makeCompat(kind: ServerKind | "unknown" | "auto"): CompatProfile {
+/** Resolve the thinking-budget request field for a concrete model: an explicit
+ *  `modelOptions[id].thinkingBudgetField` override wins over the per-kind
+ *  default. Use it to force vLLM's `thinking_token_budget` on a server whose
+ *  kind cannot be detected (renamed wrapper, remote SGLang/TGI, …). */
+export function resolveThinkingBudgetField(
+	modelId: string | undefined,
+	kind: ServerKind | "unknown" | "auto" | undefined,
+): string | undefined {
+	const override = modelId ? modelOptionsFor(modelId)?.thinkingBudgetField : undefined;
+	if (typeof override === "string" && override.trim()) return override.trim();
+	return thinkingBudgetField(kind);
+}
+
+/** Move llama.cpp's `thinking_budget_tokens` value onto the field THIS engine
+ *  actually reads (vLLM: `thinking_token_budget`) — vLLM silently ignores the
+ *  llama.cpp name, so changing the thinking level otherwise looks like a no-op.
+ *  Returns the patched payload, or undefined when there was nothing to rename. */
+export function renameThinkingBudgetField(
+	payload: Record<string, unknown>,
+	field: string,
+): Record<string, unknown> | undefined {
+	if (!field || field === THINKING_BUDGET_FIELD) return undefined;
+	const value = payload[THINKING_BUDGET_FIELD];
+	if (value === undefined) return undefined;
+	const { [THINKING_BUDGET_FIELD]: _drop, ...rest } = payload;
+	// If the engine field is already present (pi sent the right one), keep it and
+	// just drop the llama.cpp-shaped duplicate.
+	return rest[field] !== undefined ? rest : { ...rest, [field]: value };
+}
+
+export function makeCompat(
+	kind: ServerKind | "unknown" | "auto",
+	thinkingFieldOverride?: string,
+): CompatProfile {
 	const usageInStreaming = kind !== "zinc";
-	const thinkingField = thinkingBudgetField(kind);
+	const override = thinkingFieldOverride?.trim();
+	const thinkingField = override || thinkingBudgetField(kind);
 	return {
 		supportsDeveloperRole: false,
 		supportsReasoningEffort: false,

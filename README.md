@@ -108,7 +108,7 @@ curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.
 # example-vllm-model owned_by=vllm ctx=262144
 ```
 
-**Thinking budgets** — vLLM's Qwen chat template exposes `chat_template_kwargs.enable_thinking` (verified: `false` → 0 reasoning tokens, `true` → reasoning is produced). The budget field is vLLM's own **`thinking_token_budget`** — not llama.cpp's `thinking_budget_tokens` — and it caps reasoning tokens while thinking is on (verified: `64` → 63, `128` → 127; `512` had no effect because the model stopped on its own). Configure per-level budgets under `modelOptions` as usual; for vLLM models the extension injects `thinking_token_budget`. `preserve_thinking`, `reasoning_budget_tokens` and `chat_template_kwargs.reasoning_effort` are accepted but ignored by this server.
+**Thinking budgets** — vLLM's Qwen chat template exposes `chat_template_kwargs.enable_thinking` (verified: `false` → 0 reasoning tokens, `true` → reasoning is produced). The budget field is vLLM's own **`thinking_token_budget`** — not llama.cpp's `thinking_budget_tokens` — and it caps reasoning tokens while thinking is on (verified: `64` → 63, `128` → 127; `512` had no effect because the model stopped on its own). Configure per-level budgets under `modelOptions` as usual; for vLLM models the extension injects `thinking_token_budget`. Because vLLM **silently ignores** llama.cpp's `thinking_budget_tokens`, llama-infra also **renames** that field to the engine's field on the way out (so pi's native level budget works even when the server kind is not detected). If detection fails entirely (renamed wrapper, remote SGLang/TGI), force the field per model with `modelOptions[id].thinkingBudgetField: "thinking_token_budget"`. `preserve_thinking`, `reasoning_budget_tokens` and `chat_template_kwargs.reasoning_effort` are accepted but ignored by this server.
 
 **Metrics** — Prometheus names are normalized from the `vllm:` namespace (just like `llamacpp:`), so the footer ⚡/🔥 and `▶n` (other clients) readings work unchanged. Generation rate is read from `vllm:generation_tokens_total`.
 
@@ -183,12 +183,16 @@ The resolver accepts both forms (raw id, registered display id, and the legacy `
 }
 ```
 
-Per-level thinking budget for the registered vLLM model (injected as `thinking_token_budget`):
+Per-level thinking budget for the registered vLLM model (injected as `thinking_token_budget`); add `thinkingBudgetField` only when the server kind cannot be detected — vLLM models are otherwise detected automatically:
 
 ```json
 {
   "modelOptions": {
     "Ornith1.5-Ciru-Halo-Agent (127.0.0.1:8081)": {
+      "thinkingBudgets": { "minimal": 256, "low": 1024, "medium": 4096, "high": 16384 }
+    },
+    "my-hidden-vllm": {
+      "thinkingBudgetField": "thinking_token_budget",
       "thinkingBudgets": { "minimal": 256, "low": 1024, "medium": 4096, "high": 16384 }
     }
   }
@@ -260,7 +264,7 @@ The main config menu branches into submenus:
 - **🔄 Scan** — rescan all servers now
 - **📋 Models** — per-model options (thinking budgets, replace/remove)
 - **🧪 Test** — connectivity test of all configured servers
-- **🧠 Thinking budgets** — configure per-model thinking_budget_tokens per level
+- **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM) and per-level token budgets
 - **📈 Metrics** — enable/disable footer metrics, server poll interval
 - **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
 - **♻️ Reset settings** — restore all discovery settings to their defaults
@@ -390,7 +394,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 
 ### Thinking budgets
 
-llama.cpp accepts `thinking_budget_tokens` per request; vLLM instead accepts `thinking_token_budget` (the extension picks the right field per server kind). Configure budgets per thinking level per model through the config menu (`🧠 Thinking budgets` → select model → set level). Models with any budget configured are registered with `reasoning: true`, and pi sends the budget automatically when the thinking level matches.
+llama.cpp accepts `thinking_budget_tokens` per request; vLLM instead accepts `thinking_token_budget` (the extension picks the right field per server kind, and renames a llama.cpp-shaped field to the engine field so vLLM does not silently drop it). Configure budgets per thinking level per model through the config menu (`🧠 Thinking budgets` → select model → set level), where **🔤 Budget field** overrides the field name for models whose server kind cannot be detected (leave it on `auto (per engine)` normally). Models with any budget configured are registered with `reasoning: true`, and pi sends the budget automatically when the thinking level matches.
 
 Levels: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
 
