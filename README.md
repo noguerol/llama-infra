@@ -25,6 +25,7 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 ## Features
 
 - **Multi-machine discovery** — configurable list of servers (host, ports, API key, options); probes all of them at startup and on demand
+- **HTTPS servers** — per-server `protocol` (http/https) for machines proxied behind TLS (Tailscale serve, Caddy, …); discovery, metrics, warmup and chat requests all follow the configured scheme. Only public CA-issued certificates are supported — self-signed certificates are not supported
 - **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llama-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
@@ -259,7 +260,7 @@ curl -s http://127.0.0.1:8081/health | jq '{context, slot_ctx, slots}'
 
 The main config menu branches into submenus:
 
-- **🖥️ Servers** — add/remove/edit servers; per-server settings (host, ports, API key, probeDs4, label)
+- **🖥️ Servers** — add/remove/edit servers; per-server settings (host, protocol http/https, ports, API key, probeDs4, label)
 - **🔄 Scan** — rescan all servers now
 - **📋 Models** — per-model options (thinking budgets, replace/remove)
 - **🧪 Test** — connectivity test of all configured servers
@@ -323,7 +324,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
       "ports": [8080, 8081],
       "enabled": true,
       "probeDs4": true,
-      "apiKey": "optional-bearer-token"
+      "apiKey": "optional-bearer-token",
+      "protocol": "https"
     }
   ],
   "settings": {
@@ -366,6 +368,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `enabled` | `true` | Whether to probe this server |
 | `probeDs4` | `false` | Opt-in: ping `/v1/chat/completions` for DwarfStar/ds4 servers |
 | `apiKey` | — | Optional bearer token sent on discovery and per-model requests |
+| `protocol` | `http` | URL scheme for this machine: `http` or `https` (servers proxied behind TLS). Only public CA-issued certificates are supported — self-signed certificates are not supported |
 | `costProfile` | — | `{ kW, ratePerKwh }` energy-cost profile for this machine; enables 💰 estimation (see [Energy Cost](#energy-cost-)) |
 
 ### Settings
