@@ -44,6 +44,10 @@ export interface ThinkingBudgets {
 /** Per-model options keyed by the registered model id. */
 export interface ModelOptions {
 	thinkingBudgets?: ThinkingBudgets;
+	/** Override the top-level request field that carries the thinking budget for
+	 *  THIS model (e.g. `"thinking_token_budget"` on vLLM when the server kind is
+	 *  not detected). Wins over the per-kind default; see core.thinkingBudgetField. */
+	thinkingBudgetField?: string;
 	/** Manual override to force vision detection (vLLM does not publish modalities in /v1/models). */
 	vision?: boolean;
 	/** Informative drafter/spec-decode label (vLLM does not publish it). */

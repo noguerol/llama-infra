@@ -17,10 +17,12 @@ import {
 	modelOptionsFor,
 	normalizeLevel,
 	rawIdFor,
+	renameThinkingBudgetField,
+	resolveThinkingBudgetField,
 	saveConfig,
 	setActiveConfig,
 	shared,
-	thinkingBudgetField,
+	THINKING_BUDGET_FIELD,
 } from "./core.ts";
 import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
 import { resolveCostProfile } from "./cost.ts";
@@ -467,7 +469,14 @@ export default function (pi: ExtensionAPI) {
 		return newPayload;
 	});
 
-	// ── Hook 2: per-model thinking budget ─────────────────────────────────
+	// ── Hook 2: per-model thinking budget (kind/override-aware field) ──────
+	// pi's compat may already place the level budget on the right field
+	// (`thinkingTokenBudgetField`), but two things still need fixing here:
+	//  1) a client (or a mis-detected server) sends llama.cpp's
+	//     `thinking_budget_tokens`, which vLLM silently ignores → rename it to
+	//     the engine's field (`thinking_token_budget`);
+	//  2) inject the per-level budget from `modelOptions[id].thinkingBudgets`
+	//     when the request carries none.
 	pi.on("before_provider_request", (event, ctx) => {
 		const payload = event.payload as Record<string, unknown>;
 		const modelId = typeof payload.model === "string" ? payload.model : undefined;
@@ -475,16 +484,28 @@ export default function (pi: ExtensionAPI) {
 		const compactKey = shared.compactModelIds.get(modelId) ?? modelId;
 		const baseUrl = shared.modelBaseUrls.get(compactKey);
 		const kind = shared.endpointKinds.get(baseUrl ?? "");
-		const field = thinkingBudgetField(kind as never);
+		const field = resolveThinkingBudgetField(compactKey, kind as never);
 		if (!field) return undefined;
+
+		// 1) Rename llama.cpp's field onto the engine's field when needed.
+		let next = renameThinkingBudgetField(payload, field);
+		if (next) {
+			debugLog(`thinking budget field for ${compactKey}: ${THINKING_BUDGET_FIELD} → ${field}`);
+		}
+
+		// 2) Inject/override with the configured per-level budget. Like before,
+		//    a per-model `thinkingBudgets` value wins over pi's own global budget.
 		const budgets = modelOptions()[compactKey]?.thinkingBudgets;
-		if (!budgets) return undefined;
-		const level = normalizeLevel(ctx.thinkingLevel ?? currentThinkingLevel);
-		if (!level) return undefined;
-		const value = budgets[level];
-		if (typeof value !== "number") return undefined;
-		debugLog(`thinking budget for ${compactKey} [${level}] = ${value} → ${field}`);
-		return { ...payload, [field]: value };
+		if (budgets) {
+			const level = normalizeLevel(ctx.thinkingLevel ?? currentThinkingLevel);
+			const value = level ? budgets[level] : undefined;
+			if (typeof value === "number") {
+				next = { ...(next ?? payload), [field]: value };
+				debugLog(`thinking budget for ${compactKey} [${level}] = ${value} → ${field}`);
+			}
+		}
+
+		return next;
 	});
 
 	// ── Hook 3: header warmup capture ─────────────────────────────────────

@@ -49,6 +49,11 @@ function toPiModel(
 	const hostPort = `${idSafeHost(srv.host)}:${ep.port}`;
 	const kind = ep.server;
 
+	// Per-model thinking-budget field override: wins over the per-kind default
+	// (e.g. force vLLM's `thinking_token_budget` on a server whose kind was not
+	// detected). pi reads it from `compat.thinkingTokenBudgetField` directly.
+	const compat = makeCompat(kind, modelOptionsFor(rawId)?.thinkingBudgetField);
+
 	// A server may publish a model id that already embeds this machine's tag —
 	// e.g. a vLLM started with `--served-model-name "Example-27B (gpu-host:8000)"`.
 	// The tag is only needed to disambiguate across machines, so add it only
@@ -89,7 +94,7 @@ function toPiModel(
 			reasoning: false,
 			contextWindow,
 			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
-			compat: makeCompat(kind),
+			compat,
 		};
 	}
 
@@ -108,7 +113,7 @@ function toPiModel(
 			reasoning: ep.props?.capabilities?.reasoning_supported ?? true,
 			contextWindow,
 			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
-			compat: makeCompat(kind),
+			compat,
 		};
 	}
 
@@ -129,7 +134,7 @@ function toPiModel(
 			reasoning: true,
 			contextWindow,
 			maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
-			compat: makeCompat(kind),
+			compat,
 		};
 	}
 
@@ -156,7 +161,7 @@ function toPiModel(
 		reasoning: isLlamaFamily,
 		contextWindow,
 		maxTokens: model.max_tokens ?? Math.min(contextWindow, settings.maxOutputTokens),
-		compat: makeCompat(kind),
+		compat,
 	};
 }
 

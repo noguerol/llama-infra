@@ -649,14 +649,14 @@ async function showThinkingBudgetsMenu(ctx: ExtensionContext, deps: UiDeps): Pro
 	const config = shared.activeConfig!;
 	const models = shared.lastModels;
 	for (;;) {
-		const entries = Object.entries(modelOptions()).filter(([, o]) => o.thinkingBudgets);
+		const entries = Object.entries(modelOptions()).filter(([, o]) => o.thinkingBudgets || o.thinkingBudgetField);
 		const items: Array<{ value: string; label: string; description?: string }> = [];
 		for (const m of models) {
 			const opts = modelOptions()[m.id];
 			items.push({
 				value: m.id,
 				label: `🧠 ${m.name}`,
-				description: budgetsSummary(opts?.thinkingBudgets),
+				description: `${budgetsSummary(opts?.thinkingBudgets)}${opts?.thinkingBudgetField ? ` · field: ${opts.thinkingBudgetField}` : ""}`,
 			});
 		}
 		for (const [id, opts] of entries) {
@@ -664,7 +664,7 @@ async function showThinkingBudgetsMenu(ctx: ExtensionContext, deps: UiDeps): Pro
 			items.push({
 				value: id,
 				label: `🧠 ${id}`,
-				description: `${budgetsSummary(opts.thinkingBudgets)} (not online)`,
+				description: `${budgetsSummary(opts.thinkingBudgets)}${opts.thinkingBudgetField ? ` · field: ${opts.thinkingBudgetField}` : ""} (not online)`,
 			});
 		}
 		if (items.length === 0) {
@@ -699,10 +699,34 @@ async function editModelBudgets(ctx: ExtensionContext, modelId: string): Promise
 			{ value: "low", label: `low: ${b.low ?? "—"}`, description: "" },
 			{ value: "medium", label: `medium: ${b.medium ?? "—"}`, description: "" },
 			{ value: "high", label: `high: ${b.high ?? "—"}`, description: "xhigh/max clamp to this value" },
+			{
+				value: "__field",
+				label: `🔤 Budget field: ${opts.thinkingBudgetField ?? "auto (per engine)"}`,
+				description: "top-level request field, e.g. thinking_token_budget on vLLM",
+			},
 			{ value: "clear", label: "🗑️ Clear all budgets", description: "" },
 			{ value: "__back", label: "← Back", description: "" },
 		]);
 		if (action === undefined || action === "__back") return changed;
+
+		if (action === "__field") {
+			const raw = await ctx.ui.input(
+				"🔤 Thinking-budget field (blank = auto per engine)",
+				opts.thinkingBudgetField ?? "",
+			);
+			if (raw === undefined) continue;
+			const trimmed = raw.trim();
+			if (trimmed) {
+				opts.thinkingBudgetField = trimmed;
+				ctx.ui.notify(`🔤 Budget field = ${trimmed}`, "info");
+			} else {
+				delete opts.thinkingBudgetField;
+				ctx.ui.notify("🔤 Budget field reset to auto (per engine)", "info");
+			}
+			changed = true;
+			if (opts.thinkingBudgets && Object.keys(opts.thinkingBudgets).length === 0) delete opts.thinkingBudgets;
+			continue;
+		}
 
 		if (action === "clear") {
 			delete config.modelOptions[modelId];
