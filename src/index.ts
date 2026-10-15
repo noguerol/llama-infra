@@ -21,6 +21,7 @@ import {
 	resolveThinkingBudgetField,
 	saveConfig,
 	setActiveConfig,
+	serverBaseUrl,
 	shared,
 	THINKING_BUDGET_FIELD,
 } from "./core.ts";
@@ -166,7 +167,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		pi.registerProvider(PROVIDER_NAME, {
 			name: "🦙 llama-infra (scanning…)",
-			baseUrl: `http://${first?.host ?? "127.0.0.1"}:${first?.ports[0] ?? 8080}/v1`,
+			baseUrl: first ? serverBaseUrl(first, first.ports[0] ?? 8080) : "http://127.0.0.1:8080/v1",
 			apiKey: first?.apiKey || "no-auth",
 			api: "openai-completions",
 			streamSimple: createLongTimeoutOpenAICompletionsStream,

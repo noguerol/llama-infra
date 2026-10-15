@@ -6,6 +6,7 @@
 // PI_WARMUP_TIMEOUT_MS, PI_WARMUP_COOLDOWN_MS, PI_WARMUP_DEBUG=1.
 
 import * as http from "node:http";
+import * as https from "node:https";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
@@ -171,9 +172,11 @@ function warmupRequest(
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		const url = new URL(normalizeBaseUrl(baseUrl) + "/chat/completions");
+		const isHttps = url.protocol === "https:";
+		const mod = isHttps ? https : http;
 		const options: http.RequestOptions = {
 			hostname: url.hostname,
-			port: url.port || (url.protocol === "https:" ? 443 : 80),
+			port: url.port || (isHttps ? 443 : 80),
 			path: url.pathname + url.search,
 			method: "POST",
 			headers: {
@@ -187,7 +190,7 @@ function warmupRequest(
 			agent: false,
 		};
 
-		const req = http.request(options, (res) => {
+		const req = mod.request(options, (res) => {
 			const chunks: Buffer[] = [];
 			res.on("data", (c: Buffer) => chunks.push(c));
 			res.on("end", () => {
