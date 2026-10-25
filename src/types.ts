@@ -58,6 +58,12 @@ export interface ModelOptions {
 
 export interface SettingsConfig {
 	discoveryTimeoutMs: number;
+	/**
+	 * Background re-scan of every enabled endpoint (0 = off). Needed because a model
+	 * swapped on a server that stayed up changes nothing the poller watches: without
+	 * it, discovery only runs at boot, on session_start and on an explicit scan.
+	 */
+	rescanIntervalMs: number;
 	pollIntervalMs: number;
 	pollMaxMs: number;
 	startupGraceMs: number;
@@ -175,7 +181,14 @@ export interface ServerProps {
 	cache_type_v?: string;
 }
 
-export type ServerKind = "llamacpp" | "zinc" | "lucebox" | "dwarfstar" | "lmstudio" | "vllm";
+/**
+ * `gufo` is a llama.cpp fork (https://github.com/gufo-org) that identifies itself
+ * per model (`owned_by: "gufo"`), publishes its configured context as
+ * `context_length` on /v1/models and answers /props with a placeholder, so it
+ * needs its own kind instead of falling into the llama.cpp branch (no /props,
+ * no GGUF cache types, no LM Studio catalog probes).
+ */
+export type ServerKind = "llamacpp" | "gufo" | "zinc" | "lucebox" | "dwarfstar" | "lmstudio" | "vllm";
 export type ServerMode = "single" | "router" | "unknown";
 
 export interface ModelMetadata {

@@ -36,6 +36,7 @@ export const DEFAULT_SETTINGS: SettingsConfig = {
 	pollIntervalMs: 4000,
 	pollMaxMs: 90_000,
 	startupGraceMs: 40_000,
+	rescanIntervalMs: 30_000,
 	maxOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
 	requestTimeoutMs: DEFAULT_PROVIDER_TIMEOUT_MS,
 	knownGoodFailLimit: 3,
@@ -310,7 +311,7 @@ export function applyCachedSharedState(models: import("./types.ts").PiModel[]): 
 
 // ── Compat profile ─────────────────────────────────────────────────────────
 export function supportsThinkingBudget(kind: ServerKind | "unknown" | "auto" | undefined): boolean {
-	return kind === "llamacpp" || kind === "lucebox" || kind === "vllm";
+	return kind === "llamacpp" || kind === "gufo" || kind === "lucebox" || kind === "vllm";
 }
 
 /** Top-level thinking-budget field per server family (undefined = unsupported). */
@@ -318,7 +319,15 @@ export function thinkingBudgetField(
 	kind: ServerKind | "unknown" | "auto" | undefined,
 ): string | undefined {
 	if (kind === "vllm") return VLLM_THINKING_BUDGET_FIELD;
-	if (kind === "llamacpp" || kind === "lucebox") return THINKING_BUDGET_FIELD;
+	// gufo keeps llama.cpp's spelling: it accepts `thinking_budget_tokens` on
+	// Chat/Responses for existing clients, and its own spelling is
+	// `reasoning_budget_tokens`. Verified against a live endpoint (2026-10-19):
+	// *neither* name is enforced by that build — reasoning length is identical with
+	// and without a budget — so this field is kept for forward-compatibility, not
+	// for effect. Renaming to `reasoning_budget_tokens` would change nothing today,
+	// and gufo answers 200 to unknown fields, so no status code can confirm either.
+	// Thinking itself is *not* affected: on/off works via thinkingFormat below.
+	if (kind === "llamacpp" || kind === "gufo" || kind === "lucebox") return THINKING_BUDGET_FIELD;
 	return undefined;
 }
 
@@ -370,7 +379,10 @@ export function makeCompat(
 		// (/health.chat_template_kwargs) and defaults to reasoning_effort=xhigh, so
 		// without this pi cannot turn its thinking OFF; llama.cpp Qwen templates read
 		// the same kwargs natively. Non-Qwen templates simply ignore the extra vars.
-		...(kind === "llamacpp" ? { thinkingFormat: "qwen-chat-template" as const } : {}),
+		// gufo reads the same chat_template_kwargs (docs: enable_thinking /
+		// reasoning_effort / preserve_thinking) and answers thinking models with
+		// `reasoning_content`, so the Qwen-style toggle applies unchanged.
+		...(kind === "llamacpp" || kind === "gufo" ? { thinkingFormat: "qwen-chat-template" as const } : {}),
 		...(thinkingField ? { thinkingTokenBudgetField: thinkingField } : {}),
 	};
 }

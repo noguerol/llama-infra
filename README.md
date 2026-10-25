@@ -2,13 +2,13 @@
 
 ![llama-infra banner](https://raw.githubusercontent.com/noguerol/llama-infra/main/docs/banner.jpeg)
 
-**llama-infra** turns pi into a first-class citizen of your local LLM infrastructure. It is built primarily around **llama.cpp** and its family (ZINC, DwarfStar/ds4, lucebox, LM Studio), and now also speaks the most popular OpenAI-compatible runtimes — **vLLM / SGLang / TGI** — and the **halogen** engine. It probes any number of machines — localhost, LAN or Tailscale — discovers every served model, registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
+**llama-infra** turns pi into a first-class citizen of your local LLM infrastructure. It is built primarily around **llama.cpp** and its family (ZINC, DwarfStar/ds4, lucebox, LM Studio), and now also speaks the most popular OpenAI-compatible runtimes — **vLLM / SGLang / TGI** — and the **halogen** and **gufo** engines. It probes any number of machines — localhost, LAN or Tailscale — discovers every served model, registers them into pi's native `/model` list, and gives you live Prometheus metrics, per-model thinking budgets, vision detection and a full configuration UI — all without leaving the pi prompt.
 
 ---
 
 ## Supported Servers
 
-Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an OpenAI-compatible server (vLLM-family or halogen):
+Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an OpenAI-compatible server (vLLM-family, halogen or gufo):
 
 | Server | Detection | Notes |
 |--------|-----------|-------|
@@ -18,6 +18,7 @@ Every endpoint llama-infra talks to runs llama.cpp, a direct variant, or an Open
 | **lucebox** | `GET /props` with `server.name: "luce-*"` | DeepSeek dflash server with rich metadata |
 | **LM Studio** | `GET /v1/models` + optional `/api/v1/models` metadata | Local OpenAI-compatible server backed by llama.cpp; default port `1234` |
 | **vLLM / SGLang / TGI** | `owned_by: "vllm"` in `GET /v1/models` | OpenAI-compatible runners; context from `max_model_len`; **no** `/props`, **no** `/slots`; thinking via `thinking_token_budget` |
+| **gufo** | `owned_by: "gufo"` in `GET /v1/models` | llama.cpp fork with its own runtime; context from `context_length`, drafter from `/slots[].speculative`; `/props` is a placeholder (**400** without `?model=`), so no GGUF metadata and no LM Studio catalog probes; thinking on/off via `chat_template_kwargs.enable_thinking` (see [gufo](#gufo)) |
 | **halogen** | `owned_by: "halogen"` in `GET /v1/models` with **no** `/props` | OpenAI-compatible engine; context **and vision** read from `GET /health` (`slot_ctx` / `context`, `vision.enabled`); thinking on/off via `chat_template_kwargs.enable_thinking`; metrics served in the `llamacpp:` namespace (see [halogen](#halogen)) |
 
 Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in providers for those.
@@ -35,6 +36,7 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
 - **LM Studio support** — uses LM Studio's OpenAI-compatible `/v1` API, enriches names/context/quant/vision from `/api/v1/models` (or legacy `/api/v0/models`), and avoids llama.cpp-only request fields
 - **vLLM / SGLang / TGI support** — auto-detects `owned_by: "vllm"`, reads the context window from `max_model_len`, normalizes the `vllm:` metrics namespace, and uses vLLM's own `thinking_token_budget` field (see [vLLM / SGLang / TGI](#vllm--sglang--tgi))
+- **gufo support** — auto-detects `owned_by: "gufo"`, reads the context window from `context_length` and the 🚀 drafter from `/slots[].speculative`, keeps the llama.cpp thinking contract (`thinking_budget_tokens` + `chat_template_kwargs.enable_thinking`), keeps prompt warmup on (`cache_prompt` reuse verified), skips the `/props` and LM Studio probes gufo cannot answer, and reads gufo's `llamacpp:`-namespace metrics for the speed footer and 🎯 spec-accept rate (see [gufo](#gufo))
 - **halogen support** — auto-detects `owned_by: "halogen"` and reads **both** the real context window (`/health` `slot_ctx` / `context`) and the vision capability (`/health.vision.enabled`), with an 8 s probe floor and a sticky per-machine context, so pi never compacts at the 32k fallback on a 262k model and vision-enabled models register with the 👁️ badge; thinking can be turned **off/on** through `chat_template_kwargs.enable_thinking` (see [halogen](#halogen))
 - **ZINC workaround** — ZINC rejects non-empty model IDs; the payload hook rewrites the request and normalizes tool definitions automatically
 - **Vision detection** — scans `/proc` for local llama-server processes launched with `--mmproj` and marks those models as image-capable; also reads server-reported `modalities` / `input_modalities` and halogen's `/health.vision.enabled`
@@ -69,7 +71,7 @@ pi remove npm:pi-llama-infra
 
 > **Security:** pi packages run with full system access. Install only packages you trust and review the source.
 
-**Requirements:** a working pi installation and at least one supported server running somewhere accessible (localhost, LAN or Tailscale): a llama.cpp-family server, an OpenAI-compatible vLLM/SGLang/TGI endpoint, or a halogen server. LM Studio works when its local server is started (Developer tab or `lms server start`, usually on `http://localhost:1234/v1`).
+**Requirements:** a working pi installation and at least one supported server running somewhere accessible (localhost, LAN or Tailscale): a llama.cpp-family server, an OpenAI-compatible vLLM/SGLang/TGI endpoint, a halogen server, or a gufo server. LM Studio works when its local server is started (Developer tab or `lms server start`, usually on `http://localhost:1234/v1`).
 
 ## Quick Start
 
@@ -249,6 +251,47 @@ The same format is applied to the whole llama.cpp family (their Qwen templates r
 - A halogen server that has never answered `/health` registers with the 32,768 fallback and no vision flag until the first successful probe (then the context sticks).
 - halogen takes images as `data:` URLs or bare base64 and refuses `http(s)` image URLs — a server-side contract, not a llama-infra setting.
 
+## gufo
+
+[gufo](https://github.com/gufo-org) is a llama.cpp fork with its own runtime. It answers `GET /v1/models`, `/health`, `/ready`, `/slots`, `/metrics` and the Chat/Responses endpoints, but `GET /props` is a **placeholder**: **400** `missing_model` without `?model=`, and only `{"template":"","model_info":{}}` with it. That is why gufo gets its own server kind instead of being guessed from llama.cpp metadata.
+
+```bash
+curl -s http://127.0.0.1:8080/v1/models | jq '.data[0] | {id, owned_by, context_length, architecture}'
+# { "id": "…", "owned_by": "gufo", "context_length": 262144,
+#   "architecture": { "input_modalities": ["text", "image"] } }
+```
+
+**Context window** — read from `context_length` on the model entry (`/slots[].n_ctx` carries the same number). gufo publishes **no** max output length: its `--max-tokens` default is `-1` (generate until EOS or the remaining context) and the configured value never reaches an HTTP response, so llama-infra registers its client cap `min(context_length, settings.maxOutputTokens)` — 32,768 by default. A gufo build that starts publishing `max_tokens` on `/v1/models` is honoured as-is, no change needed.
+
+**Thinking** — gufo keeps llama.cpp's contract: reasoning arrives as `reasoning_content`, thinking is toggled with `chat_template_kwargs.enable_thinking`, and llama.cpp's top-level `thinking_budget_tokens` is accepted for existing clients (gufo's own spelling is `reasoning_budget_tokens`). Verified against a live gufo endpoint serving a reasoning model:
+
+| request | reasoning output |
+|---|---|
+| baseline | produced (`reasoning_content` non-empty) |
+| `chat_template_kwargs: { enable_thinking: false }` | **none** |
+| `reasoning_effort: "none"` | **none** |
+| `thinking: { type: "disabled" }` | **none** |
+| `thinking_budget_tokens: 32` / `128` | unchanged — budgets are not enforced |
+| `reasoning_budget_tokens: 32` / `128` | unchanged — gufo's **own** spelling is ignored too |
+
+gufo models are registered with pi's `qwen-chat-template` thinking format, so pi's **off** level maps to `enable_thinking: false` and genuinely stops reasoning. Per-level budgets are still sent under `thinking_budget_tokens` — deliberately: it costs nothing and goes live the moment a build honors a budget field, while switching the name to `reasoning_budget_tokens` would change nothing today. Where a build ignores them they are inert rather than harmful — use **off** when thinking must be gone.
+
+**Speculative decoding** — gufo spells it `--speculative mtp --mtp-model …`, which llama.cpp's arg parser has never seen; its `/props` placeholder cannot carry `draft_path` or `default_generation_settings.speculative`; and a containerized gufo is invisible to the local `/proc` scan. `/slots` is the one route that survives every deployment shape, so a gufo slot with `speculative: true` is translated onto the plugin's existing drafter label: `Example-Reasoner [👁️🚀]`. `speculative: false` or a missing `/slots` route adds nothing, llama.cpp keeps reading `/props` as before, and `modelOptions[id].drafter` still overrides.
+
+**Prompt warmup** — gufo accepts llama.cpp's `cache_prompt: true` and reuses what it cached: a repeated request reported `usage.prompt_tokens_details.cached_tokens: 62`, where `cache_prompt: false` and an omitted field both reported `0`. So warmup stays enabled for gufo. Because gufo answers **200 to unknown request fields**, a successful response is never proof a field was understood — every claim on this page is behavioral (reasoning length, `cached_tokens`, rendered badges), never a status code.
+
+**Metrics** — gufo serves the `llamacpp:` Prometheus namespace (`prompt_tokens_total`, `tokens_predicted_total`, `requests_processing`, `spec_decode_num_*`) next to its own `gufo_*` counters, so the ⚡ prefill / 🔥 generation footer works unchanged, and `spec_decode_num_accepted/draft_tokens_total` give the 🎯 accept rate (70.8% on the live MTP endpoint).
+
+**Vision** — `architecture.input_modalities` containing `"image"` registers the model as image-capable with the 👁️ badge and `input: ["text", "image"]`.
+
+**Known limitations**
+
+- The configured `--max-tokens` is not discoverable, so the registered `maxTokens` is llama-infra's cap rather than the server's setting (an upstream `max_tokens` on `/v1/models` would close this).
+- GGUF metadata is unavailable: `/props` answers with a placeholder, so quant and KV-cache badges stay empty. The drafter is recovered from `/slots` instead.
+- `/health` is only `{"status":"ok"}` (no context, no vision), so there is nothing to graft from it the way halogen needs.
+- `♻️` prefix-cache hit rate never renders: gufo's `/metrics` has no `prefix_cache_hits_total` / `prefix_cache_queries_total`, only the token counter `prompt_tokens_cached_total`, which is not a ratio.
+- Per-token thinking budgets are advertised but unenforced by the builds tested so far, in **both** spellings, so the budget knob is a no-op on gufo; **off** is the control that works.
+
 ## Commands
 
 | Command | Description |
@@ -256,6 +299,7 @@ The same format is applied to the whole llama.cpp family (their Qwen templates r
 | `/llama-infra` | Quick status (servers, discovered models, metrics) |
 | `/llama-infra config` | ⚙️ Interactive configuration menu |
 | `/llama-infra scan` | Rescan all servers now |
+| `/llama-infra use <model>` | Switch this session to a discovered model |
 | `/llama-infra status` | Detailed per-endpoint report |
 | `/llama-infra list` | List discovered models with metadata badges |
 | `/llama-infra metrics` | Toggle live speed & metrics in the footer |
@@ -271,9 +315,24 @@ The main config menu branches into submenus:
 - **🧪 Test** — connectivity test of all configured servers
 - **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM) and per-level token budgets
 - **📈 Metrics** — enable/disable footer metrics, server poll interval
-- **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
+- **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, background rescan, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
 - **♻️ Reset settings** — restore all discovery settings to their defaults
 - **ℹ️ About** — extension info
+
+### `/llama-infra use <model>`
+
+Selects a discovered model for the running session (pi's own selection path, so the footer, `/model` and the session log all agree), instead of making you open `/model` after every swap:
+
+```
+/llama-infra use uncensored      # fragment of id, name or raw server id
+/llama-infra use Example-27B (gpu-host:8080)
+```
+
+Matching is separator- and case-insensitive across the registered id, the display name and the raw served id, and it rescans first when nothing matches. An unloaded router model loses to an equally matching loaded one. Nothing is guessed: an ambiguous fragment lists the candidates and asks, and an unknown one lists the closest ids.
+
+**Swapping models without restarting pi.** A model that disappears from a server while the session is using it is detected on the next discovery (background rescan, `/llama-infra scan`, or session start). If exactly one model replaced it on that endpoint, llama-infra switches the session onto it and announces it; with several, it tells you to run `/llama-infra use`. A request can never go out with a stale id that this extension issued and cannot map: it reports `"<id>" is not served on <host:port>` and points at the command instead of letting the server reject it.
+
+Model flavor words (`Uncensored`, `Instruct`, `Alpaca`, `Base`, `MoE`, …) are kept in registered names — only quantization, file and version suffixes are stripped — so a fine-tune never registers under the name of the model it was tuned from.
 
 ### `/llama-infra list`
 
@@ -381,6 +440,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `discoveryTimeoutMs` | `2000` | Per-request timeout when probing endpoints |
 | `pollIntervalMs` | `4000` | Background re-poll rate while servers load models |
 | `pollMaxMs` | `90000` | Max total polling time |
+| `rescanIntervalMs` | `30000` | Background re-scan of every enabled endpoint, so a model swapped on a running server is picked up without a manual scan; `0` turns it off |
 | `startupGraceMs` | `40000` | Keep trying at startup while nothing has answered |
 | `knownGoodFailLimit` | `3` | Consecutive failures before a live endpoint is dropped |
 | `detectVision` | `true` | Scan `/proc` for `--mmproj` + read server-reported modalities |
@@ -535,7 +595,7 @@ Zero external npm dependencies (only pi's bundled `@earendil-works/pi-coding-age
 
 Subsystems:
 
-- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio, vLLM, halogen)
+- **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, gufo, ZINC, DwarfStar, lucebox, LM Studio, vLLM, halogen)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
 - **Speed & metrics subsystem** — client-side per-token speed measurement (prefill + moving-window generation), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration

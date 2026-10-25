@@ -25,6 +25,17 @@ import {
 	THINKING_BUDGET_FIELD,
 } from "./core.ts";
 import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
+import {
+	detectVanishedModel,
+	endpointTags,
+	hostTagOf,
+	pickModel,
+	resolveStaleServerModelId,
+	suggestIds,
+} from "./model-switch.ts";
+
+/** What `ctx.modelRegistry.find()` hands back to `pi.setModel()`. */
+type RegistryModel = ReturnType<ExtensionContext["modelRegistry"]["find"]>;
 import { resolveCostProfile } from "./cost.ts";
 import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
 export { modelOptionsFor };
@@ -108,12 +119,25 @@ export default function (pi: ExtensionAPI) {
 	let lastSignature: string | undefined;
 	let pollTimer: ReturnType<typeof setTimeout> | undefined;
 	let polling = false;
+	let discoveryTimer: ReturnType<typeof setInterval> | undefined;
 	let providerIsEmpty = true;
 	let currentThinkingLevel: string | undefined;
 
 	const knownGood = new Set<string>();
 	const consecutiveFails = new Map<string, number>();
 	let anyEverOk = false;
+
+	// ── Session model tracking (activation needs both) ────────────────────
+	// pi keeps the session's model selection across registerProvider(), so after a
+	// server swap the session can be pointed at an id nobody serves. Activation
+	// therefore needs (a) the id the session is on and (b) a live ctx, since
+	// pi.setModel()/ui.notify() are only reachable through one. discovery has no
+	// ctx of its own, so the freshest UI ctx seen in any handler is remembered.
+	let lastUiCtx: ExtensionContext | undefined;
+	let currentModelId: string | undefined;
+	/** `(host:port)` tags this extension can produce — used to recognize our ids. */
+	const ourTags = endpointTags(config.servers);
+	const warnedStaleIds = new Set<string>();
 	const startedAt = Date.now();
 	let extensionActive = true;
 
@@ -154,6 +178,91 @@ export default function (pi: ExtensionAPI) {
 		} catch {
 			return undefined;
 		}
+	}
+
+	// ── Activation helpers ────────────────────────────────────────────────
+	/** Keep the freshest usable UI context for notify()/setModel(). */
+	function noteCtx(ctx: ExtensionContext | undefined): void {
+		if (ctxHasUI(ctx)) lastUiCtx = ctx;
+	}
+
+	function uiCtx(): ExtensionContext | undefined {
+		return ctxHasUI(lastUiCtx) ? lastUiCtx : undefined;
+	}
+
+	function notify(message: string, kind: "info" | "warning" = "info"): void {
+		const ctx = uiCtx();
+		if (!ctx) return;
+		try {
+			ctx.ui.notify(message, kind);
+		} catch (err) {
+			debugLog(`notify ignored: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/** Select a discovered model for this session (pi's own selection path). */
+	async function activateModel(target: import("./types.ts").PiModel, ctx: ExtensionContext): Promise<boolean> {
+		let model: RegistryModel | undefined;
+		try {
+			model = ctx.modelRegistry.find(PROVIDER_NAME, target.id);
+		} catch (err) {
+			debugLog(`modelRegistry.find failed: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
+		}
+		if (!model) {
+			notify(`🦙 "${target.id}" is not registered with pi — run /llama-infra scan`, "warning");
+			return false;
+		}
+		const ok = await pi.setModel(model);
+		if (!ok) {
+			notify(`🦙 could not activate "${target.id}"`, "warning");
+			return false;
+		}
+		currentModelId = target.id;
+		notify(`🦙 using ${target.id} → served as ${target.serverModelId}`);
+		return true;
+	}
+
+	/** `/llama-infra use <model>`: resolve a query to one model and activate it. */
+	async function useModel(query: string, ctx: ExtensionContext): Promise<void> {
+		noteCtx(ctx);
+		if (!query) {
+			const ids = shared.lastModels.map((m) => m.id);
+			notify(
+				ids.length === 0
+					? "🦙 no models discovered — try /llama-infra scan"
+					: `🦙 which model? /llama-infra use <name> · ${ids.slice(0, 6).join(", ")}${ids.length > 6 ? ` (+${ids.length - 6})` : ""}`,
+				"warning",
+			);
+			return;
+		}
+		// A model that was just started is by definition not in the list yet.
+		let pick = pickModel(shared.lastModels, query);
+		if (pick.matches.length === 0) {
+			await rescan(ctx);
+			pick = pickModel(shared.lastModels, query);
+		}
+		if (pick.matches.length === 0) {
+			const hints = suggestIds(shared.lastModels, query);
+			notify(
+				hints.length > 0
+					? `🦙 nothing matches "${query}" — try: ${hints.join(", ")}`
+					: `🦙 nothing matches "${query}" (${shared.lastModels.length} discovered)`,
+				"warning",
+			);
+			return;
+		}
+		if (pick.matches.length > 1) {
+			notify(
+				`🦙 "${query}" matches ${pick.matches.length}: ${pick.matches
+					.slice(0, 5)
+					.map((m) => m.id)
+					.join(", ")}${pick.matches.length > 5 ? " …" : ""} — be more specific`,
+				"warning",
+			);
+			return;
+		}
+		await activateModel(pick.matches[0], ctx);
 	}
 
 	// ── Empty provider registration (pi boots without waiting) ───────────
@@ -233,7 +342,31 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const { buildAndRegisterProvider } = await loadReg();
+			const prevModels = shared.lastModels;
 			const models = buildAndRegisterProvider(pi, scan, config);
+			// A model swap (or a server that came back with something else) leaves
+			// the session pointed at an id no one serves, and the next request dies
+			// with the server's own "model not found". Adopt the replacement when
+			// there is exactly one on that endpoint; otherwise say what to type.
+			const repair = detectVanishedModel(prevModels, models, currentModelId);
+			if (repair) {
+				const where = epKey(repair.gone.endpoint?.host ?? "?", repair.gone.endpoint?.port ?? 0);
+				const ctx = uiCtx();
+				if (repair.candidates.length === 1 && ctx) {
+					const only = repair.candidates[0];
+					debugLog(`"${repair.gone.id}" no longer served on ${where}; adopting "${only.id}"`);
+					void activateModel(only, ctx).catch((err) =>
+						debugLog(`auto-adopt failed: ${err instanceof Error ? err.message : String(err)}`),
+					);
+				} else if (repair.candidates.length > 1) {
+					notify(
+						`🦙 "${repair.gone.id}" is no longer served on ${where} — /llama-infra use <model> (${repair.candidates.length} available)`,
+						"warning",
+					);
+				} else {
+					notify(`🦙 "${repair.gone.id}" is no longer served on ${where}`, "warning");
+				}
+			}
 			providerIsEmpty = models.length === 0;
 			shared.registeredCount = models.length;
 			shared.lastModels = models;
@@ -308,6 +441,33 @@ export default function (pi: ExtensionAPI) {
 		if (pollTimer) clearTimeout(pollTimer);
 		pollTimer = undefined;
 		polling = false;
+	}
+
+	/**
+	 * Re-scan every enabled endpoint on a timer. The poll loop above only watches
+	 * endpoints that are loading or failing, so swapping the model on a server that
+	 * stayed up — the normal way to change models — would otherwise be invisible
+	 * until a manual scan or a new session. Discovery is idempotent: this is one
+	 * cheap GET round per tick, and nothing is re-registered unless the signature
+	 * actually changed.
+	 */
+	function startDiscoveryInterval() {
+		const ms = config.settings.rescanIntervalMs;
+		if (!extensionActive || discoveryTimer || !(ms > 0)) return;
+		discoveryTimer = setInterval(() => {
+			if (!extensionActive || polling) return;
+			void discoverAndRegister()
+				.then((r) => {
+					if (extensionActive && !polling) schedulePolling(r.shouldPoll);
+				})
+				.catch((err) => debugLog(`background rescan failed: ${err instanceof Error ? err.message : String(err)}`));
+		}, ms);
+		discoveryTimer.unref?.();
+	}
+
+	function stopDiscoveryInterval() {
+		if (discoveryTimer) clearInterval(discoveryTimer);
+		discoveryTimer = undefined;
 	}
 
 	async function rescan(ctx?: ExtensionContext) {
@@ -418,9 +578,32 @@ export default function (pi: ExtensionAPI) {
 		const modelInPayload = typeof payload.model === "string" ? payload.model : undefined;
 		if (!modelInPayload) return undefined;
 		const raw = shared.serverModelIds.get(modelInPayload);
-		if (raw === undefined || raw === modelInPayload) return undefined;
-		debugLog(`model id "${modelInPayload}" → "${raw}"`);
-		return { ...payload, model: raw };
+		if (raw !== undefined && raw !== modelInPayload) {
+			debugLog(`model id "${modelInPayload}" → "${raw}"`);
+			return { ...payload, model: raw };
+		}
+		// Unmapped decorated id: either the registration was renamed but the model
+		// is still there (recover it, scoped to the same host:port), or it is gone
+		// and the server would answer with its own opaque "model not found" — say
+		// what happened once per id instead. Foreign providers' models carry no tag
+		// we issued, so they are never mentioned here.
+		if (raw === undefined) {
+			const recovered = resolveStaleServerModelId(modelInPayload, shared.serverModelIds);
+			if (recovered !== undefined) {
+				debugLog(`stale id "${modelInPayload}" → "${recovered}" (same endpoint)`);
+				return { ...payload, model: recovered };
+			}
+			const tag = hostTagOf(modelInPayload);
+			if (tag !== undefined && ourTags.has(tag) && !warnedStaleIds.has(modelInPayload)) {
+				warnedStaleIds.add(modelInPayload);
+				debugLog(`no server id for "${modelInPayload}" — sending as-is`);
+				notify(
+					`🦙 "${modelInPayload}" is not served on ${tag} — /llama-infra use <model> to pick a live one`,
+					"warning",
+				);
+			}
+		}
+		return undefined;
 	});
 
 	// ── Hook 1: ZINC payload workaround ───────────────────────────────────
@@ -576,13 +759,28 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Command ───────────────────────────────────────────────────────────
 	pi.registerCommand("llama-infra", {
-		description: "🦙 llama-infra: scan, status, config, metrics for llama.cpp/ZINC/ds4/lucebox/LM Studio/vLLM",
-		getArgumentCompletions: (prefix) =>
-			["config", "scan", "status", "list", "metrics", "help"]
-				.filter((s) => s.startsWith(prefix))
-				.map((s) => ({ value: s, label: s })),
+		description: "🦙 llama-infra: scan, use <model>, status, config, metrics for llama.cpp/ZINC/ds4/lucebox/LM Studio/vLLM/gufo",
+		getArgumentCompletions: (prefix) => {
+			const raw = prefix ?? "";
+			// `use ` completes discovered model ids; ids contain spaces, so only the
+			// first token is treated as the subcommand everywhere below.
+			const usePrefix = /^use\s+/i.exec(raw);
+			if (usePrefix) {
+				const q = raw.slice(usePrefix[0].length);
+				const matches = pickModel(shared.lastModels, q).matches;
+				const list = matches.length > 0 ? matches : shared.lastModels;
+				return list.slice(0, 20).map((m) => ({ value: `use ${m.id}`, label: m.id }));
+			}
+			return ["use", "config", "scan", "status", "list", "metrics", "help"]
+				.filter((s) => s.startsWith(raw.trim().toLowerCase()))
+				.map((s) => ({ value: s, label: s }));
+		},
 		handler: async (args, ctx) => {
-			const sub = (args ?? "").trim().toLowerCase();
+			noteCtx(ctx);
+			const rawArgs = (args ?? "").trim();
+			const sp = rawArgs.indexOf(" ");
+			const sub = (sp < 0 ? rawArgs : rawArgs.slice(0, sp)).toLowerCase();
+			const rest = sp < 0 ? "" : rawArgs.slice(sp + 1).trim();
 			const ui = await loadUi();
 			const deps: import("./ui.ts").UiDeps = {
 				rescan,
@@ -605,6 +803,9 @@ export default function (pi: ExtensionAPI) {
 				case "list":
 					await ui.showModelList(ctx);
 					break;
+				case "use":
+					await useModel(rest, ctx);
+					break;
 				case "metrics":
 					await toggleMetrics(ctx);
 					break;
@@ -613,6 +814,7 @@ export default function (pi: ExtensionAPI) {
 					break;
 				default:
 					ctx.ui.notify(`❓ unknown "${sub}". Try /llama-infra help`, "warning");
+					break;
 			}
 		},
 	});
@@ -622,6 +824,7 @@ export default function (pi: ExtensionAPI) {
 	void discoverAndRegister()
 		.then((r) => {
 			if (extensionActive) schedulePolling(r.shouldPoll);
+			startDiscoveryInterval();
 		})
 		.catch((err) => {
 			if (extensionActive) debugLog(`initial discovery failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -629,6 +832,12 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Events ────────────────────────────────────────────────────────────
 	pi.on("session_start", async (_event, ctx) => {
+		noteCtx(ctx);
+		try {
+			currentModelId = (ctx.model as { id?: string } | undefined)?.id;
+		} catch {
+			// stale ctx — keep the previous id rather than lose it
+		}
 		const w = await ensureWarmup();
 		if (w) {
 			if (ctxHasUI(ctx)) w.status.bind(ctx.ui);
@@ -650,6 +859,7 @@ export default function (pi: ExtensionAPI) {
 			.then((r) => {
 				if (!extensionActive) return;
 				schedulePolling(r.shouldPoll);
+				startDiscoveryInterval();
 				updateStatusFooter(ctx);
 			})
 			.catch((err) => {
@@ -660,6 +870,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", async (event, ctx) => {
+		noteCtx(ctx);
+		currentModelId = event.model.id;
 		if (event.model.provider !== PROVIDER_NAME) {
 			speedApi?.stop(ctx);
 			metricsApi?.stop(ctx);
@@ -691,6 +903,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		extensionActive = false;
 		stopPolling();
+		stopDiscoveryInterval();
 		speedApi?.stop();
 		metricsApi?.stop();
 		warm?.warmer.dispose();

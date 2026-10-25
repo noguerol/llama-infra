@@ -1,7 +1,7 @@
 {
   "name": "pi-llama-infra",
   "version": "1.8.1",
-  "description": "Discovery, metrics and control of llama.cpp-family servers and OpenAI-compatible servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio, vLLM, SGLang, TGI, halogen): scan machines (localhost, LAN, Tailscale), register models, read real context windows from /props or /health, live metrics, per-model thinking budgets, vision detection, native config UI.",
+  "description": "Discovery, metrics and control of llama.cpp-family servers and OpenAI-compatible servers for pi (llama.cpp, ZINC, DwarfStar/ds4, lucebox, LM Studio, vLLM, SGLang, TGI, halogen, gufo): scan machines (localhost, LAN, Tailscale), register models, read real context windows from /props or /health, live metrics, per-model thinking budgets, vision detection, native config UI.",
   "keywords": [
     "pi-package",
     "llamacpp",
@@ -18,6 +18,7 @@
     "sglang",
     "tgi",
     "halogen",
+    "gufo",
     "rocm"
   ],
   "author": "llama-infra contributors <https://github.com/noguerol>",

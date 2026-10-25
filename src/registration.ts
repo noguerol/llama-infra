@@ -147,11 +147,17 @@ function toPiModel(
 	const nameMapName = ep.nameMap?.get(rawId);
 	const displayName = nameMapName ? cleanModelName(nameMapName) : baseName2;
 
+	// gufo carries neither meta.n_ctx nor a usable /props: its configured context is
+	// `context_length` on /v1/models. It never publishes a max output length (its
+	// --max-tokens defaults to "until EOS or the remaining context"), so the client
+	// cap below is what keeps pi's requests inside the slot.
 	const contextWindow =
 		model.meta?.n_ctx ?? model.meta?.n_ctx_train ?? model.max_model_len ??
 		model.context_window ?? model.context_length ?? 32768;
 
-	const isLlamaFamily = kind === "llamacpp";
+	// gufo is a llama.cpp fork: reasoning output arrives as `reasoning_content` and
+	// the chat template drives thinking, exactly like llama.cpp.
+	const isLlamaFamily = kind === "llamacpp" || kind === "gufo";
 
 	return {
 		...common,

@@ -85,6 +85,7 @@ type ServerKindLike = ServerKind | "auto" | "unknown";
 /** Tolerant icon + label per server kind; unknown/future kinds never crash. */
 const KIND_META: Record<ServerKindLike, { icon: string; label: string }> = {
 	llamacpp: { icon: "🦙", label: "llama.cpp" },
+	gufo: { icon: "🦉", label: "gufo" },
 	zinc: { icon: "⚡", label: "ZINC" },
 	lucebox: { icon: "💡", label: "lucebox" },
 	dwarfstar: { icon: "🕵️", label: "ds4" },
@@ -101,9 +102,11 @@ function serverKindLabel(kind: string | undefined): string {
 	return `${meta.icon} ${meta.label}`;
 }
 
-/** GGUF/llama.cpp-specific KV cache types are meaningless for vLLM. */
+/** GGUF/llama.cpp-specific KV cache types are meaningless for vLLM, and
+ *  unreachable for gufo: it answers /props with a placeholder, so cache_type_*
+ *  never arrives. Excluding both keeps the badge list honest. */
 function showsGgufKvCache(kind: string | undefined): boolean {
-	return kind !== "vllm";
+	return kind !== "vllm" && kind !== "gufo";
 }
 
 function metadataBadges(m: ModelMetadata | undefined, kind?: string): string {
@@ -245,6 +248,7 @@ const SETTING_LABELS: Record<string, string> = {
 	discoveryTimeoutMs: "Discovery timeout",
 	pollIntervalMs: "Poll interval",
 	pollMaxMs: "Poll budget",
+	rescanIntervalMs: "Background rescan",
 	startupGraceMs: "Startup grace",
 	knownGoodFailLimit: "Known-good fail limit",
 	detectVision: "Vision detection",
@@ -296,7 +300,18 @@ export async function showModelList(ctx: ExtensionContext): Promise<void> {
 		}, ep?.server);
 		const ctxWin = formatCtx(m.contextWindow);
 		const status = m.routerStatus && m.routerStatus !== "loaded" ? ` · [${m.routerStatus}]` : "";
-		lines.push(`   • ${m.name}`, `     ${m.id} — ${where}${md} · ctx ${ctxWin || "?"}${status}`);
+		// Mark the model this session is actually talking to, so a swap that only
+		// changed the server (not the selection) is visible in the list.
+		let active = false;
+		try {
+			active = ctx.model?.id === m.id;
+		} catch {
+			// stale ctx — no marker
+		}
+		lines.push(
+			`   • ${m.name}${active ? "  ← in use" : ""}`,
+			`     ${m.id} — ${where}${md} · ctx ${ctxWin || "?"}${status}`,
+		);
 	}
 	ctx.ui.notify(lines.join("\n"), "info");
 }
@@ -309,6 +324,7 @@ export function showHelp(ctx: ExtensionContext): void {
 			"  /llama-infra            → status",
 			"  /llama-infra config     → ⚙️ settings",
 			"  /llama-infra scan       → rescan",
+			"  /llama-infra use <m>    → switch this session to a discovered model",
 			"  /llama-infra status     → per-endpoint report",
 			"  /llama-infra list       → models with quant/vision/drafter",
 			"  /llama-infra metrics    → toggle live speed & metrics in the footer",
@@ -1019,6 +1035,13 @@ async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<vo
 			values: fmt([30_000, 60_000, 90_000, 120_000, 300_000]),
 		},
 		{
+			id: "rescanIntervalMs",
+			label: "Background rescan",
+			description: "How often every enabled server is re-scanned, so a model swapped on a running server shows up without /llama-infra scan. 0 turns it off.",
+			currentValue: s.rescanIntervalMs === 0 ? "off" : formatMs(s.rescanIntervalMs),
+			values: [0, 15_000, 30_000, 60_000, 300_000, 900_000].map((v) => (v === 0 ? "off" : formatMs(v))),
+		},
+		{
 			id: "startupGraceMs",
 			label: "Startup grace",
 			description: "Extra patience at pi startup while no server has answered yet, so slow machines still get discovered.",
@@ -1087,6 +1110,7 @@ const durationOpts: Record<string, number[]> = {
 		discoveryTimeoutMs: [500, 1000, 1500, 2000, 3000, 5000],
 		pollIntervalMs: [2000, 3000, 4000, 5000, 10_000],
 		pollMaxMs: [30_000, 60_000, 90_000, 120_000, 300_000],
+		rescanIntervalMs: [0, 15_000, 30_000, 60_000, 300_000, 900_000],
 		startupGraceMs: [10_000, 20_000, 40_000, 60_000, 120_000],
 		requestTimeoutMs: [60_000, 300_000, 600_000, 1_200_000, 1_800_000, 3_600_000],
 	};
@@ -1118,7 +1142,7 @@ const durationOpts: Record<string, number[]> = {
 					}
 					default: {
 						const opts = id === "warmup" ? undefined : durationOpts[id];
-						const v = opts?.find((n) => formatMs(n) === value);
+						const v = opts?.find((n) => (n === 0 ? "off" : formatMs(n)) === value);
 						if (v !== undefined) st[id] = v;
 					}
 				}

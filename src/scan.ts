@@ -239,7 +239,13 @@ export function cleanModelName(rawId: string): string {
 		/[-_.][Qq]5_[0K]_[MS]$/i,
 		/[-_.][Qq]6_[Kk](_[A-Z])?$/i,
 		/[-_.][Qq]8_[0O]$/i,
-		/-(?:Uncensored|Alpaca|Instruct|Chat|Turbo|Base|MoE|UD)(?:-[a-zA-Z0-9]+)*$/i,
+		// Packaging token without a file extension (…-Orca-v5.0-GGUF).
+		/[-_.](?:gguf|ggml)$/i,
+		// Flavor words (Uncensored, Instruct, Alpaca, Base, MoE, …) are NOT stripped:
+		// they are the only difference between a fine-tune and the model it came
+		// from, so stripping them made a swapped model register under the previous
+		// model's name (…-Flash-Next-Uncensored → "…-Flash-Next") and the two
+		// endpoints became indistinguishable in /model and in modelOptions keys.
 		/-(?:v[0-9.]+)(?:-[a-zA-Z0-9]+)*$/i,
 		/-+$/,
 	];
@@ -359,6 +365,45 @@ export async function fetchServerProps(
 	return undefined;
 }
 
+/** One entry of `GET /slots` (llama.cpp and its forks). */
+export interface ServerSlot {
+	model?: string;
+	speculative?: boolean;
+	n_ctx?: number;
+}
+
+/**
+ * `GET /slots`. gufo reports speculative decoding here and nowhere else: its
+ * `/props` is a placeholder (so neither `model.draft_path` nor
+ * `default_generation_settings.speculative` can fire) and a containerized gufo
+ * is invisible to the /proc arg scan, so `/slots[].speculative` is the only
+ * signal that survives all of its deployment shapes.
+ */
+export async function fetchServerSlots(
+	baseUrl: string,
+	timeoutMs: number,
+	apiKey?: string,
+): Promise<ServerSlot[] | undefined> {
+	const rootUrl = baseUrl.replace(/\/v1\/?$/, "");
+	try {
+		const { status, body } = await httpGet(`${rootUrl}/slots`, timeoutMs, apiKey);
+		if (status >= 200 && status < 300) {
+			const parsed = JSON.parse(body) as unknown;
+			return Array.isArray(parsed) ? (parsed as ServerSlot[]) : undefined;
+		}
+	} catch {
+		// no /slots route → nothing to learn about speculative decoding
+	}
+	return undefined;
+}
+
+/** The slot describing `rawId`: gufo names the slot's model, but a single-slot
+ *  server (gufo's `--sessions 1`) is unambiguous even when the name differs. */
+export function slotForModel(slots: ServerSlot[] | undefined, rawId: string): ServerSlot | undefined {
+	if (!slots || slots.length === 0) return undefined;
+	return slots.find((s) => s.model === rawId) ?? (slots.length === 1 ? slots[0] : undefined);
+}
+
 export function lmStudioKey(info: LmStudioModelInfo): string | undefined {
 	return info.key ?? info.id;
 }
@@ -440,6 +485,13 @@ function enrichWithLmStudioCatalog(models: LlamaCppModel[], catalog: LmStudioMod
 }
 
 // ── Server kind detection ──────────────────────────────────────────────────
+/** gufo (a llama.cpp fork) names itself per model, and its /props is a 400 without
+ *  `?model=` plus a placeholder with it, so identity can only come from the model
+ *  list. Shared with the scan loop, which probes before detection runs. */
+function isGufoModelList(models: LlamaCppModel[]): boolean {
+	return models.some((m) => String(m.owned_by ?? "").toLowerCase() === "gufo");
+}
+
 export async function detectServerKind(
 	_baseUrl: string,
 	models: LlamaCppModel[],
@@ -455,6 +507,8 @@ export async function detectServerKind(
 	if (models.some((m) => m.lmStudio)) return "lmstudio";
 	// vLLM exposes owned_by:"vllm" + max_model_len (no /props, no meta.n_ctx).
 	if (models.some((m) => String(m.owned_by ?? "").toLowerCase() === "vllm")) return "vllm";
+	// gufo exposes owned_by:"gufo" + context_length (its /props is a placeholder).
+	if (isGufoModelList(models)) return "gufo";
 	if (models.length > 0) return "llamacpp";
 	return "unknown";
 }
@@ -511,6 +565,7 @@ export function buildModelMetadata(
 	local: LocalServerInfo | undefined,
 	kind?: ServerKind | "unknown",
 	health?: { vision?: boolean },
+	slot?: ServerSlot,
 ): ModelMetadata {
 	const meta: ModelMetadata = {};
 
@@ -544,6 +599,12 @@ export function buildModelMetadata(
 	}
 	if (!meta.drafter && local?.draft) meta.drafter = local.draft;
 	else if (!meta.drafter && local?.hasDraft) meta.drafter = "draft model";
+	// gufo spells speculative decoding `--speculative mtp --mtp-model …`, which
+	// parseServerArgs has never seen, its /props placeholder cannot express it, and
+	// a container hides the process anyway. /slots[].speculative is the surviving
+	// signal, translated onto llama.cpp's existing "speculative" label so the 🚀
+	// badge, /llama-infra list and the models cache need no gufo branch.
+	if (!meta.drafter && kind === "gufo" && slot?.speculative === true) meta.drafter = "speculative";
 
 	// Manual overrides win: vLLM publishes neither modalities nor drafter.
 	const override = modelOptionsFor(rawId);
@@ -604,7 +665,11 @@ export async function fetchModelsFromEndpoint(
 		}
 
 		let props = await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey);
-		const lmStudioCatalog = props ? undefined : await fetchLmStudioCatalog(baseUrl, settings.discoveryTimeoutMs, srv.apiKey);
+		// gufo answers /props with a placeholder and is never LM Studio, so the two
+		// catalog probes below would only ever return 404.
+		const gufo = isGufoModelList(models);
+		const lmStudioCatalog =
+			props || gufo ? undefined : await fetchLmStudioCatalog(baseUrl, settings.discoveryTimeoutMs, srv.apiKey);
 		if (lmStudioCatalog) models = enrichWithLmStudioCatalog(models, lmStudioCatalog);
 		const isRouterShape = models.some((m) => m.path !== undefined || m.status !== undefined);
 		const routerProps = props?.role === "router";
@@ -621,6 +686,10 @@ export async function fetchModelsFromEndpoint(
 		if (kind === "lucebox") {
 			props = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey)) ?? props;
 		}
+		// Speculative decoding is only discoverable on /slots for gufo; llama.cpp and
+		// its other forks already report it through /props.
+		const slots =
+			kind === "gufo" ? await fetchServerSlots(baseUrl, settings.discoveryTimeoutMs, srv.apiKey) : undefined;
 
 		const local = isLocalHost(srv.host) && settings.detectVision ? localServers.get(port) : undefined;
 
@@ -630,7 +699,10 @@ export async function fetchModelsFromEndpoint(
 			if (mode === "router" && !model.architecture?.input_modalities && model.status?.value === "loaded") {
 				modelProps = (await fetchServerProps(baseUrl, settings.discoveryTimeoutMs, srv.apiKey, rawId)) ?? undefined;
 			}
-			ep.meta.set(rawId, buildModelMetadata(rawId, model, modelProps, local, kind, engineHealth));
+			ep.meta.set(
+				rawId,
+				buildModelMetadata(rawId, model, modelProps, local, kind, engineHealth, slotForModel(slots, rawId)),
+			);
 		}
 
 		ep.server = kind;
