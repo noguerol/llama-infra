@@ -293,7 +293,10 @@ export function buildAndRegisterProvider(
 		apiKey: defaultApiKey,
 		api: "openai-completions",
 		streamSimple: createLongTimeoutOpenAICompletionsStream,
-		models: piModels,
+		// `compat.thinkingTokenBudgetField: false` is pi's documented runtime
+		// opt-out ("Default: false"), but its TS type only allows the field-name
+		// union → cast the models array here.
+		models: piModels as any,
 	});
 
 	// Persist the last known good models so a fresh pi process can register them

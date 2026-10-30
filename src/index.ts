@@ -22,6 +22,8 @@ import {
 	saveConfig,
 	setActiveConfig,
 	shared,
+	stripThinkingBudgetFields,
+	thinkingBudgetFieldDisabled,
 	THINKING_BUDGET_FIELD,
 } from "./core.ts";
 import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
@@ -485,7 +487,17 @@ export default function (pi: ExtensionAPI) {
 		const baseUrl = shared.modelBaseUrls.get(compactKey);
 		const kind = shared.endpointKinds.get(baseUrl ?? "");
 		const field = resolveThinkingBudgetField(compactKey, kind as never);
-		if (!field) return undefined;
+		if (!field) {
+			// Explicit opt-out (`thinkingBudgetField: false`): servers with a strict
+			// native worker answer HTTP 400 to unknown fields, so make sure a
+			// budget field from any client never reaches them.
+			if (thinkingBudgetFieldDisabled(compactKey)) {
+				const stripped = stripThinkingBudgetFields(payload);
+				if (stripped) debugLog(`thinking budget fields stripped for ${compactKey} (field disabled)`);
+				return stripped;
+			}
+			return undefined;
+		}
 
 		// 1) Rename llama.cpp's field onto the engine's field when needed.
 		let next = renameThinkingBudgetField(payload, field);

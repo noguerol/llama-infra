@@ -5,7 +5,7 @@
 
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { DEFAULT_PROVIDER_TIMEOUT_MS, shared } from "./core.ts";
+import { DEFAULT_PROVIDER_TIMEOUT_MS, debugLog, disableThinkingBudgetField, shared, stripThinkingBudgetFields } from "./core.ts";
 
 type AssistantMessageEvent = any;
 type AssistantMessage = any;
@@ -232,6 +232,7 @@ export function clampMaxTokensToFit(
 export function composeOnPayload(
 	prev: ((params: any, model: any) => unknown) | undefined,
 	contextWindow: number | undefined,
+	stripFields?: string[],
 ): (params: any, model: any) => Promise<any> {
 	return async (params: any, model: any) => {
 		let effective = params;
@@ -239,18 +240,89 @@ export function composeOnPayload(
 			const updated = await prev(params, model);
 			if (updated !== null && updated !== undefined) effective = updated;
 		}
-		if (
-			typeof contextWindow === "number" &&
-			Number.isFinite(contextWindow) &&
-			contextWindow > 0 &&
-			effective !== null &&
-			typeof effective === "object"
-		) {
-			const clamped = clampMaxTokensToFit(effective as Record<string, unknown>, contextWindow);
-			if (clamped !== undefined) return { ...effective, max_tokens: clamped };
+		if (effective !== null && typeof effective === "object") {
+			// Opt-out path (self-healing retry): drop every thinking-budget field.
+			if (stripFields !== undefined) effective = stripFieldsFrom(effective, stripFields);
+			if (
+				typeof contextWindow === "number" &&
+				Number.isFinite(contextWindow) &&
+				contextWindow > 0 &&
+				effective !== null &&
+				typeof effective === "object"
+			) {
+				const clamped = clampMaxTokensToFit(effective as Record<string, unknown>, contextWindow);
+				if (clamped !== undefined) return { ...effective, max_tokens: clamped };
+			}
 		}
 		return effective;
 	};
+}
+
+/** Drop the known thinking-budget fields plus any extra field name (a custom
+ *  `thinkingBudgetField` the server rejected). */
+function stripFieldsFrom(params: any, extra: string[]): any {
+	let next = stripThinkingBudgetFields(params) ?? params;
+	for (const field of extra) {
+		if (!field || next[field] === undefined) continue;
+		const { [field]: _drop, ...rest } = next;
+		next = rest;
+	}
+	return next;
+}
+
+/** Field names used by pi / OpenAI-compatible engines for the thinking budget. */
+const THINKING_BUDGET_FIELDS = ["thinking_token_budget", "thinking_budget_tokens", "thinking_budget"];
+
+/** True when a provider error says the server REJECTED the thinking-budget
+ *  field, e.g. `not supported by the … native worker: thinking_token_budget`. Only these errors trigger the self-healing retry, so
+ *  unrelated 400s (context overflow, bad tool schema, …) are never retried. */
+export function rejectsThinkingBudgetField(message: string | undefined): boolean {
+	if (!message) return false;
+	if (!THINKING_BUDGET_FIELDS.some((field) => message.includes(field))) return false;
+	return /(not supported|unsupported|not supported by|unrecognized|unrecognised|not recognized|not recognised|unknown|unexpected|extra_forbidden|not allowed|invalid|no such field)/i.test(
+		message,
+	);
+}
+
+/** Concatenate every string a pi-ai error event exposes as its message. */
+function errorTextOf(event: any): string {
+	const err = event?.error;
+	if (typeof err === "string") return err;
+	return [err?.errorMessage, err?.message, event?.errorMessage, event?.message]
+		.filter((part): part is string => typeof part === "string")
+		.join("\n");
+}
+
+/** Decide whether an error event justifies ONE retry without the thinking-budget
+ *  field. Returns the reason, or undefined to surface the error untouched.
+ *
+ *  - The message names the field and rejects it → clear evidence.
+ *  - A validation error (400/422) while a budget field was actually sent → worth
+ *    one probe, because some transports drop the body ("400 status code (no
+ *    body)"); the opt-out is only persisted if the retry then succeeds. */
+export function budgetFieldRejection(event: any, sentFields: string[]): string | undefined {
+	if (!event || event.type !== "error") return undefined;
+	const message = errorTextOf(event);
+	if (rejectsThinkingBudgetField(message)) return "the error names the budget field";
+	if (sentFields.length > 0 && /\b(400|422)\b/.test(message)) return "validation error while sending a budget field";
+	return undefined;
+}
+
+/** Thinking-budget field configured on a registered model (compat), if any. */
+function configuredBudgetField(model: any): string | undefined {
+	const field = model?.compat?.thinkingTokenBudgetField;
+	return typeof field === "string" && field ? field : undefined;
+}
+
+/** Stop pi from sending the thinking-budget field on FUTURE turns of this
+ *  session (the registered model object is what pi serializes requests from;
+ *  the persisted config only takes effect on the next scan/registration). */
+function disableBudgetFieldOnModel(model: any): void {
+	if (!model || typeof model !== "object") return;
+	if (model.compat && typeof model.compat === "object") {
+		model.compat.thinkingTokenBudgetField = false;
+		model.compat.supportsThinkingTokenBudget = false;
+	}
 }
 
 export function createLongTimeoutOpenAICompletionsStream(model: any, context: any, options?: Record<string, any>) {
@@ -264,15 +336,87 @@ export function createLongTimeoutOpenAICompletionsStream(model: any, context: an
 			// ctx.modelRegistry.streamSimple() calls, which bypass the
 			// before_provider_request plugin hook.
 			const contextWindow = typeof model?.contextWindow === "number" ? model.contextWindow : undefined;
-			const inner = streamSimple(
-				requestModel,
-				context,
-				withLocalRuntimeDefaults(
-					{ ...options, onPayload: composeOnPayload(options?.onPayload, contextWindow) },
-					activeRequestTimeoutMs(),
-				),
-			);
-			for await (const event of inner) out.push(event);
+			// Which thinking-budget fields the payload actually carried, so a bare
+			// "400 status code (no body)" is only retried when dropping a field can
+			// plausibly be the fix.
+			let sentBudgetFields: string[] = [];
+			const buildOptions = (stripFields?: string[]) => {
+				const composed = composeOnPayload(options?.onPayload, contextWindow, stripFields);
+				const onPayload = async (params: any, payloadModel: any) => {
+					const final = await composed(params, payloadModel);
+					sentBudgetFields =
+						final && typeof final === "object"
+							? THINKING_BUDGET_FIELDS.filter((field) => final[field] !== undefined)
+							: [];
+					return final;
+				};
+				return withLocalRuntimeDefaults({ ...options, onPayload }, activeRequestTimeoutMs());
+			};
+
+			let inner = streamSimple(requestModel, context, buildOptions());
+			const iterator = inner[Symbol.asyncIterator]();
+
+			// pi-ai emits `start` before the response is read, so an HTTP 400 arrives as
+			// `start` → `error`. Buffer events until the stream either fails or really
+			// starts producing content (a 400 never produces content), which keeps the
+			// decision reversible without delaying visible output.
+			const buffered: any[] = [];
+			let rejection: string | undefined;
+			for (;;) {
+				const next = await iterator.next();
+				if (next.done) break;
+				const event = next.value;
+				buffered.push(event);
+				if (event?.type === "error") {
+					// Self-healing: some engines (strict Python/vLLM-fork native workers)
+					// reject the thinking-budget field with HTTP 400 instead of ignoring it.
+					// Retry ONCE without any budget field, and only keep the opt-out when
+					// the retry works — unrelated 400s (context overflow, bad tools) are
+					// surfaced untouched.
+					rejection = budgetFieldRejection(event, sentBudgetFields);
+					break;
+				}
+				if (event?.type !== "start") break; // real content → no retry
+			}
+
+			if (rejection) {
+				const configured = configuredBudgetField(requestModel) ?? configuredBudgetField(model);
+				debugLog(`thinking-budget field rejected by ${model?.id} (${rejection}): ${errorTextOf(buffered[buffered.length - 1])}`);
+				const retryModel = {
+					...requestModel,
+					compat: {
+						...(requestModel?.compat ?? {}),
+						thinkingTokenBudgetField: false,
+						supportsThinkingTokenBudget: false,
+					},
+				};
+				const strip = configured ? [...THINKING_BUDGET_FIELDS, configured] : THINKING_BUDGET_FIELDS;
+				const retry = streamSimple(retryModel, context, buildOptions(strip));
+				let retryErrored = false;
+				for await (const event of retry) {
+					if (event?.type === "error") retryErrored = true;
+					out.push(event);
+				}
+				if (typeof retry.result === "function") out.end(await retry.result());
+				else out.end();
+				if (!retryErrored) {
+					console.error(
+						`[llama-infra] ${model?.id ?? "model"} rejected the thinking-budget field${configured ? ` (${configured})` : ""}; retried without it and saved the opt-out (\"thinkingBudgetField\": false).`,
+					);
+					disableThinkingBudgetField(model?.id);
+					// The persisted config applies on the next scan; this keeps the current
+					// session from resending (and re-failing) on every following turn.
+					disableBudgetFieldOnModel(model);
+				}
+				return;
+			}
+
+			for (const event of buffered) out.push(event);
+			for (;;) {
+				const next = await iterator.next();
+				if (next.done) break;
+				out.push(next.value);
+			}
 			if (typeof inner.result === "function") out.end(await inner.result());
 			else out.end();
 		} catch (err) {

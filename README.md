@@ -109,6 +109,21 @@ curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.
 
 **Thinking budgets** — vLLM's Qwen chat template exposes `chat_template_kwargs.enable_thinking` (verified: `false` → 0 reasoning tokens, `true` → reasoning is produced). The budget field is vLLM's own **`thinking_token_budget`** — not llama.cpp's `thinking_budget_tokens` — and it caps reasoning tokens while thinking is on (verified: `64` → 63, `128` → 127; `512` had no effect because the model stopped on its own). Configure per-level budgets under `modelOptions` as usual; for vLLM models the extension injects `thinking_token_budget`. Because vLLM **silently ignores** llama.cpp's `thinking_budget_tokens`, llama-infra also **renames** that field to the engine's field on the way out (so pi's native level budget works even when the server kind is not detected). If detection fails entirely (renamed wrapper, remote SGLang/TGI), force the field per model with `modelOptions[id].thinkingBudgetField: "thinking_token_budget"`. `preserve_thinking`, `reasoning_budget_tokens` and `chat_template_kwargs.reasoning_effort` are accepted but ignored by this server.
 
+**Servers that reject the field** — some OpenAI-compatible engines validate request fields strictly instead of ignoring unknown ones: a vLLM fork served by a custom *native worker* answers HTTP 400 `not supported by the … native worker: thinking_token_budget`. Two things happen then:
+
+- **Self-healing (automatic)** — when a turn fails with that error before producing any content (pi-ai emits `start` first, so llama-infra buffers until the error or the first real content event), or with a bare `400 status code (no body)` while a budget field was actually sent, llama-infra retries the request **once** without any budget field. If the retry succeeds it remembers the opt-out — `modelOptions[id].thinkingBudgetField: false` is written to the config, so neither the current session nor later scans ever send the field again. If the retry fails too (an unrelated 400, e.g. context overflow) the original error is surfaced untouched and nothing is persisted.
+- **Manual opt-out** — set `"thinkingBudgetField": false` per model (or type `none` / `off` in **🧠 Thinking budgets → 🔤 Budget field**). llama-infra then registers the model with `compat.thinkingTokenBudgetField: false` (pi's documented "do not send it" value), stops renaming into the field and strips any leftover `thinking_budget_tokens` / `thinking_token_budget` from the outgoing payload.
+
+```json
+{
+  "modelOptions": {
+    "Example-Model (gpu-host:8081)": { "thinkingBudgetField": false }
+  }
+}
+```
+
+Thinking levels and `chat_template_kwargs` keep working; only the token budget is not sent.
+
 **Metrics** — Prometheus names are normalized from the `vllm:` namespace (just like `llamacpp:`), so the footer ⚡/🔥 and `▶n` (other clients) readings work unchanged. Generation rate is read from `vllm:generation_tokens_total`.
 
 **Local vision detection & manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info over HTTP. For **local engines** (loopback host, with `detectVision` enabled) llama-infra now reads the engine's own process args from `/proc` and uses them as ground truth for vision:
@@ -193,10 +208,15 @@ Per-level thinking budget for the registered vLLM model (injected as `thinking_t
     "my-hidden-vllm": {
       "thinkingBudgetField": "thinking_token_budget",
       "thinkingBudgets": { "minimal": 256, "low": 1024, "medium": 4096, "high": 16384 }
+    },
+    "strict-worker-vllm-fork": {
+      "thinkingBudgetField": false
     }
   }
 }
 ```
+
+`"thinkingBudgetField": false` disables the field entirely (servers that reject unknown request fields, e.g. a vLLM fork with a strict native worker). The same opt-out can be typed as `none`/`off` in the **🔤 Budget field** prompt, and llama-infra writes it on its own when such a server rejects a request.
 
 ## halogen
 
@@ -269,7 +289,7 @@ The main config menu branches into submenus:
 - **🔄 Scan** — rescan all servers now
 - **📋 Models** — per-model options (thinking budgets, replace/remove)
 - **🧪 Test** — connectivity test of all configured servers
-- **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM) and per-level token budgets
+- **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM, or `none`/`off` to send none on servers that reject it) and per-level token budgets
 - **📈 Metrics** — enable/disable footer metrics, server poll interval
 - **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
 - **♻️ Reset settings** — restore all discovery settings to their defaults
@@ -398,6 +418,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 ### Thinking budgets
 
 llama.cpp accepts `thinking_budget_tokens` per request; vLLM instead accepts `thinking_token_budget` (the extension picks the right field per server kind, and renames a llama.cpp-shaped field to the engine field so vLLM does not silently drop it). Configure budgets per thinking level per model through the config menu (`🧠 Thinking budgets` → select model → set level), where **🔤 Budget field** overrides the field name for models whose server kind cannot be detected (leave it on `auto (per engine)` normally). Models with any budget configured are registered with `reasoning: true`, and pi sends the budget automatically when the thinking level matches.
+
+**🔤 Budget field** also accepts `none` / `off` (config: `"thinkingBudgetField": false`): the server then receives **no** budget field at all. Use it on engines that reject unknown request fields — a strict vLLM fork with a custom native worker answers HTTP 400 `not supported by the … native worker: thinking_token_budget`. llama-infra also detects that error on its own: it retries the request once without the field and, only if the retry succeeds, saves the opt-out for that model.
 
 Levels: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
 

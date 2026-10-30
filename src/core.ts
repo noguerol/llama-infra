@@ -126,6 +126,25 @@ function normalizeServer(s: Record<string, unknown>): import("./types.ts").Serve
 	};
 }
 
+/** Normalize the persisted per-model options: `thinkingBudgetField` accepts a
+ *  field name, `false` or the words `none`/`off`/`disabled` (→ `false`), and a
+ *  blank value falls back to the per-engine default (key dropped). */
+function normalizeModelOptions(raw: unknown): Record<string, ModelOptions> {
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+	const out: Record<string, ModelOptions> = {};
+	for (const [id, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+		const opts: ModelOptions = { ...(value as ModelOptions) };
+		if ("thinkingBudgetField" in opts) {
+			const parsed = parseThinkingBudgetFieldOption(opts.thinkingBudgetField);
+			if (parsed === undefined) delete opts.thinkingBudgetField;
+			else opts.thinkingBudgetField = parsed;
+		}
+		out[id] = opts;
+	}
+	return out;
+}
+
 export function loadConfig(): InfraConfig {
 	const defaults: InfraConfig = {
 		servers: DEFAULT_SERVERS,
@@ -141,7 +160,7 @@ export function loadConfig(): InfraConfig {
 					? raw.servers.map((s) => normalizeServer(s as Record<string, unknown>))
 					: defaults.servers,
 				settings: normalizeSettings(raw.settings),
-				modelOptions: raw.modelOptions ?? {},
+				modelOptions: normalizeModelOptions(raw.modelOptions),
 			};
 		} catch (err) {
 			console.error(`[llama-infra] Config load error: ${err}`);
@@ -158,7 +177,7 @@ export function loadConfig(): InfraConfig {
 					? raw.servers.map((s) => normalizeServer(s as Record<string, unknown>))
 					: defaults.servers,
 				settings: normalizeSettings(raw.settings),
-				modelOptions: raw.modelOptions ?? {},
+				modelOptions: normalizeModelOptions(raw.modelOptions),
 			};
 			debugLog(`migrated legacy config from ${legacyPath}`);
 			return migrated;
@@ -323,14 +342,16 @@ export function thinkingBudgetField(
 }
 
 /** Resolve the thinking-budget request field for a concrete model: an explicit
- *  `modelOptions[id].thinkingBudgetField` override wins over the per-kind
- *  default. Use it to force vLLM's `thinking_token_budget` on a server whose
- *  kind cannot be detected (renamed wrapper, remote SGLang/TGI, …). */
+ *  `modelOptions[id].thinkingBudgetField` wins over the per-kind default. Use a
+ *  field name to force vLLM's `thinking_token_budget` on a server whose kind
+ *  cannot be detected (renamed wrapper, remote SGLang/TGI, …), or `false` to
+ *  send none at all on servers that reject unknown request fields. */
 export function resolveThinkingBudgetField(
 	modelId: string | undefined,
 	kind: ServerKind | "unknown" | "auto" | undefined,
 ): string | undefined {
 	const override = modelId ? modelOptionsFor(modelId)?.thinkingBudgetField : undefined;
+	if (override === false) return undefined;
 	if (typeof override === "string" && override.trim()) return override.trim();
 	return thinkingBudgetField(kind);
 }
@@ -354,11 +375,14 @@ export function renameThinkingBudgetField(
 
 export function makeCompat(
 	kind: ServerKind | "unknown" | "auto",
-	thinkingFieldOverride?: string,
+	thinkingFieldOverride?: string | false,
 ): CompatProfile {
 	const usageInStreaming = kind !== "zinc";
-	const override = thinkingFieldOverride?.trim();
-	const thinkingField = override || thinkingBudgetField(kind);
+	// `false` is an explicit opt-out: the server rejects the field, so pi must not
+	// send it and neither alias may re-introduce it.
+	const disabled = thinkingFieldOverride === false;
+	const override = typeof thinkingFieldOverride === "string" ? thinkingFieldOverride.trim() : "";
+	const thinkingField = disabled ? undefined : override || thinkingBudgetField(kind);
 	return {
 		supportsDeveloperRole: false,
 		supportsReasoningEffort: false,
@@ -371,7 +395,11 @@ export function makeCompat(
 		// without this pi cannot turn its thinking OFF; llama.cpp Qwen templates read
 		// the same kwargs natively. Non-Qwen templates simply ignore the extra vars.
 		...(kind === "llamacpp" ? { thinkingFormat: "qwen-chat-template" as const } : {}),
-		...(thinkingField ? { thinkingTokenBudgetField: thinkingField } : {}),
+		...(disabled
+			? { thinkingTokenBudgetField: false as const, supportsThinkingTokenBudget: false }
+			: thinkingField
+				? { thinkingTokenBudgetField: thinkingField }
+				: {}),
 	};
 }
 
@@ -405,27 +433,87 @@ export function modelOptions(): Record<string, ModelOptions> {
 	return shared.activeConfig?.modelOptions ?? {};
 }
 
-/** Resolve per-model config overrides for a raw server model id: accepts the
- *  raw id, its registered compact id, the display id `<raw id> (host:port)`,
- *  or a legacy "host:port/<raw id>" key (the legacy form registration.ts
- *  migrates forward). */
-export function modelOptionsFor(rawId: string): ModelOptions | undefined {
+/** Resolve the `modelOptions` key that applies to a raw server model id:
+ *  accepts the raw id, its registered compact id, the display id
+ *  `<raw id> (host:port)`, or a legacy "host:port/<raw id>" key (the legacy
+ *  form registration.ts migrates forward). */
+export function modelOptionsKeyFor(rawId: string): string | undefined {
 	if (!rawId) return undefined;
 	const opts = modelOptions();
-	if (opts[rawId]) return opts[rawId];
+	if (opts[rawId]) return rawId;
 	const compact = compactIdFor(rawId);
-	if (compact && opts[compact]) return opts[compact];
+	if (compact && opts[compact]) return compact;
 	// Display ids: "<raw id> (host:port)" (compact form registered in pi).
 	const prefix = `${rawId} (`;
 	for (const key of Object.keys(opts)) {
-		if (key.startsWith(prefix) && key.endsWith(")")) return opts[key];
+		if (key.startsWith(prefix) && key.endsWith(")")) return key;
 	}
 	// Legacy keys: "<host>:<port>/<raw id>" (see registration.ts migration).
 	const rawSuffix = `/${rawId.replace(/^\/+/, "")}`;
 	for (const key of Object.keys(opts)) {
-		if (key.endsWith(rawSuffix)) return opts[key];
+		if (key.endsWith(rawSuffix)) return key;
 	}
 	return undefined;
+}
+
+/** Resolve per-model config overrides for a raw server model id (accepted key
+ *  shapes: `modelOptionsKeyFor`). */
+export function modelOptionsFor(rawId: string): ModelOptions | undefined {
+	const key = modelOptionsKeyFor(rawId);
+	return key ? modelOptions()[key] : undefined;
+}
+
+/** Values a user may type in the 🔤 Budget field prompt that mean "send no
+ *  budget field at all" instead of naming a request field. */
+const DISABLED_FIELD_VALUES = new Set(["none", "off", "false", "disable", "disabled", "-", "no"]);
+
+/** Parse a raw `thinkingBudgetField` option: a field name, `false` (disabled),
+ *  or undefined (auto per engine). Blank strings mean auto and the words in
+ *  DISABLED_FIELD_VALUES mean disabled, so both can be typed in the menu. */
+export function parseThinkingBudgetFieldOption(raw: unknown): string | false | undefined {
+	if (raw === false) return false;
+	if (typeof raw !== "string") return undefined;
+	const trimmed = raw.trim();
+	if (!trimmed) return undefined;
+	if (DISABLED_FIELD_VALUES.has(trimmed.toLowerCase())) return false;
+	return trimmed;
+}
+
+/** True when the model explicitly opted out of any thinking-budget field. */
+export function thinkingBudgetFieldDisabled(modelId: string | undefined): boolean {
+	if (!modelId) return false;
+	return modelOptionsFor(modelId)?.thinkingBudgetField === false;
+}
+
+/** Persist "this model's server rejects the thinking-budget field" so pi stops
+ *  sending it and llama-infra stops renaming into it. Called when a server
+ *  answers with an explicit "… is not supported: thinking_token_budget" error.
+ *  Returns true when the configuration actually changed. */
+export function disableThinkingBudgetField(modelId: string | undefined): boolean {
+	const config = shared.activeConfig;
+	if (!config || !modelId) return false;
+	const key = modelOptionsKeyFor(modelId) ?? compactIdFor(modelId) ?? modelId;
+	const opts = (config.modelOptions[key] ??= {});
+	if (opts.thinkingBudgetField === false) return false;
+	opts.thinkingBudgetField = false;
+	saveConfig(config);
+	debugLog(`thinking-budget field disabled for ${key} (server rejected it)`);
+	return true;
+}
+
+/** Remove every known thinking-budget field from a request payload (used when a
+ *  model opted out, so a stale client cannot smuggle one back in). Returns the
+ *  patched payload, or undefined when there was nothing to drop. */
+export function stripThinkingBudgetFields(
+	payload: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	let next: Record<string, unknown> | undefined;
+	for (const field of [THINKING_BUDGET_FIELD, VLLM_THINKING_BUDGET_FIELD]) {
+		if (payload[field] === undefined) continue;
+		const { [field]: _drop, ...rest } = next ?? payload;
+		next = rest;
+	}
+	return next;
 }
 
 /** Remove a per-model `maxTokens` override, preserving every other per-model

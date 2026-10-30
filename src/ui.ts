@@ -9,6 +9,7 @@ import {
 	getConfigPath,
 	idSafeHost,
 	modelOptions,
+	parseThinkingBudgetFieldOption,
 	saveConfig,
 	serverLabel,
 	serversShareEndpoint,
@@ -124,6 +125,13 @@ function budgetsSummary(b?: ThinkingBudgets): string {
 		if (typeof v === "number") parts.push(`${k}: ${v}`);
 	}
 	return parts.length > 0 ? parts.join(", ") : "none";
+}
+
+/** Human label for the per-model thinking-budget field option. */
+function fieldSummary(field?: string | false): string {
+	if (field === false) return "field: off (not sent)";
+	if (typeof field === "string" && field.trim()) return `field: ${field}`;
+	return "";
 }
 
 function isServerUp(serverId: string): boolean {
@@ -649,22 +657,24 @@ async function showThinkingBudgetsMenu(ctx: ExtensionContext, deps: UiDeps): Pro
 	const config = shared.activeConfig!;
 	const models = shared.lastModels;
 	for (;;) {
-		const entries = Object.entries(modelOptions()).filter(([, o]) => o.thinkingBudgets || o.thinkingBudgetField);
+		const entries = Object.entries(modelOptions()).filter(([, o]) => o.thinkingBudgets || o.thinkingBudgetField !== undefined);
 		const items: Array<{ value: string; label: string; description?: string }> = [];
 		for (const m of models) {
 			const opts = modelOptions()[m.id];
+			const field = fieldSummary(opts?.thinkingBudgetField);
 			items.push({
 				value: m.id,
 				label: `🧠 ${m.name}`,
-				description: `${budgetsSummary(opts?.thinkingBudgets)}${opts?.thinkingBudgetField ? ` · field: ${opts.thinkingBudgetField}` : ""}`,
+				description: `${budgetsSummary(opts?.thinkingBudgets)}${field ? ` · ${field}` : ""}`,
 			});
 		}
 		for (const [id, opts] of entries) {
 			if (models.some((m) => m.id === id)) continue;
+			const field = fieldSummary(opts.thinkingBudgetField);
 			items.push({
 				value: id,
 				label: `🧠 ${id}`,
-				description: `${budgetsSummary(opts.thinkingBudgets)}${opts.thinkingBudgetField ? ` · field: ${opts.thinkingBudgetField}` : ""} (not online)`,
+				description: `${budgetsSummary(opts.thinkingBudgets)}${field ? ` · ${field}` : ""} (not online)`,
 			});
 		}
 		if (items.length === 0) {
@@ -701,8 +711,8 @@ async function editModelBudgets(ctx: ExtensionContext, modelId: string): Promise
 			{ value: "high", label: `high: ${b.high ?? "—"}`, description: "xhigh/max clamp to this value" },
 			{
 				value: "__field",
-				label: `🔤 Budget field: ${opts.thinkingBudgetField ?? "auto (per engine)"}`,
-				description: "top-level request field, e.g. thinking_token_budget on vLLM",
+				label: `🔤 Budget field: ${opts.thinkingBudgetField === false ? "off (not sent)" : (opts.thinkingBudgetField ?? "auto (per engine)")}`,
+				description: "top-level request field, e.g. thinking_token_budget on vLLM · type none/off when the server rejects it",
 			},
 			{ value: "clear", label: "🗑️ Clear all budgets", description: "" },
 			{ value: "__back", label: "← Back", description: "" },
@@ -711,14 +721,17 @@ async function editModelBudgets(ctx: ExtensionContext, modelId: string): Promise
 
 		if (action === "__field") {
 			const raw = await ctx.ui.input(
-				"🔤 Thinking-budget field (blank = auto per engine)",
-				opts.thinkingBudgetField ?? "",
+				"🔤 Thinking-budget field (blank = auto per engine, none/off = never send it)",
+				opts.thinkingBudgetField === false ? "none" : (opts.thinkingBudgetField ?? ""),
 			);
 			if (raw === undefined) continue;
-			const trimmed = raw.trim();
-			if (trimmed) {
-				opts.thinkingBudgetField = trimmed;
-				ctx.ui.notify(`🔤 Budget field = ${trimmed}`, "info");
+			const parsed = parseThinkingBudgetFieldOption(raw);
+			if (parsed === false) {
+				opts.thinkingBudgetField = false;
+				ctx.ui.notify("🔤 Budget field disabled — no thinking budget is sent to this server", "info");
+			} else if (parsed) {
+				opts.thinkingBudgetField = parsed;
+				ctx.ui.notify(`🔤 Budget field = ${parsed}`, "info");
 			} else {
 				delete opts.thinkingBudgetField;
 				ctx.ui.notify("🔤 Budget field reset to auto (per engine)", "info");

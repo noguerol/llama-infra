@@ -5,6 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.2] - 2026-10-30
+
+### Added
+
+- **Self-healing for servers that reject the thinking-budget field.** Strict engines (e.g. a vLLM fork served by a custom *native worker*) answer HTTP 400 `not supported by the … native worker: thinking_token_budget` instead of ignoring the field. The provider stream now detects that error — pi-ai emits `start` before it, so the stream is buffered until the error or the first real content event — or a body-less `400 status code` while a budget field was actually sent, retries the request **once** without any budget field, and — only when the retry succeeds — persists `modelOptions[id].thinkingBudgetField: false` so neither the running session nor later scans send it again. Unrelated 4xx errors (context overflow, bad tools) are surfaced untouched and never persisted; dropping the field on such a retry is harmless because a 400 generates nothing.
+- **Manual opt-out: `modelOptions[id].thinkingBudgetField: false`** (also `none` / `off` / `disabled` typed in **🧠 Thinking budgets → 🔤 Budget field**). The model is registered with `compat.thinkingTokenBudgetField: false` + `supportsThinkingTokenBudget: false`, so pi never sends a level budget, llama-infra stops renaming `thinking_budget_tokens` into the engine field, and the `before_provider_request` hook strips any leftover budget field from foreign clients.
+
+### Changed
+
+- `CompatProfile` accepts `thinkingTokenBudgetField: string | false` and the new `supportsThinkingTokenBudget: boolean` alias; `ModelOptions.thinkingBudgetField` is `string | false`.
+- `makeCompat()`, `resolveThinkingBudgetField()` and the persisted-config loader understand the opt-out (`false`, `none`, `off`, `disabled`, `-`), and blank values still mean “auto per engine”.
+- `modelOptionsKeyFor()` extracted from `modelOptionsFor()` so the self-healing opt-out is written to the key that already matches the model (raw id, compact id, display id or legacy `host:port/<id>`).
+
+### Tests
+
+- `test/thinking-heal.test.ts` — end-to-end against a local HTTP server: the 400 is healed by one retry, the answer streams, the opt-out reaches the model `compat`, the config file and the next turn (single request, no field); an unrelated 400 still surfaces and persists nothing.
+- `test/vllm-thinking.test.ts` — opt-out parsing/resolution, `makeCompat(kind, false)`, registration, payload stripping and config persistence.
+
 ## [1.8.1] - 2026-10-14
 
 ### Changed
