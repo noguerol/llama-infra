@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Speed footer reported impossible numbers** (e.g. `⚡ 97964 t/s`, `🔥 67.3 t/s`) that did not match trimegisto's `↑prefill ↓decode` telemetry for the same agents. Two independent bugs:
+  - *Prefill* divided the full `prompt_tokens` by a tiny time-to-first-token, so a **prefix-cache hit** exploded the rate: an 80k-token prompt answered in 0.56 s was reported as `142489 t/s` (measured: 142489 vs a real 9029 t/s for the uncached call). It now uses the *uncached* prompt tokens (`usage.input + usage.cacheWrite`) and only reports a throughput when the sample is dominated by prompt processing (TTFT ≥ 1 s and ≥ 500 tokens, the same thresholds as trimegisto); otherwise the footer shows the TTFT itself (`⚡ 561ms`). Trusted samples are EMA-smoothed (α = 0.35).
+  - *Generation* counted stream **chunks** as tokens and took a 1.5 s moving window over their arrival times. It now counts generated tokens over the whole request (`usage.output ÷ time since first token`), estimates live samples from streamed characters with a tokens-per-character ratio learned from real usage, requires a ≥ 400 ms span, and smooths with the same EMA.
+
+### Changed
+
+- `speed.ts` rewritten around per-request state (`requestStart`, `firstTokenAt`, `deltaChars`, live `usage.output`) instead of an arrival-sample window; `⚡` shows a smoothed t/s or a TTFT, `🔥` shows the whole-request average. Measurements (and the learned chars→tokens ratio) are now reset when the active model changes instead of being inherited by the next model.
+
+### Tests
+
+- `test/speed.test.ts` — new cases for the cache-hit prefill (80k tokens in 500 ms → `⚡ 500ms`, never a six-figure rate), a real prefill sample (18k tokens in 2 s → 9000 t/s), cache-write accounting (only uncached tokens count), the whole-request decode average, chunk→token calibration and tool-call fragments.
+- Verified end-to-end against a live OpenAI-compatible engine: cold 80k prompt → `⚡ 9047 t/s` (independently measured 9029 t/s); the same prompt again (prefix cache) → `⚡ 560ms`; decode `🔥 157 t/s` matching the measured 157 t/s.
+
 ## [1.8.2] - 2026-10-30
 
 ### Added

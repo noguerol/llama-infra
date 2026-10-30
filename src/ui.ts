@@ -894,7 +894,7 @@ async function showMetricsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<voi
 			{
 				value: "toggle",
 				label: config.settings.metricsEnabled ? "🔴 Disable footer speed metrics" : "🟢 Enable footer speed metrics",
-				description: "⚡ prefill + 🔥 generation speed per token; server /metrics supplement",
+				description: "⚡ prefill t/s (or TTFT when too short/cached) + 🔥 generation speed; server /metrics supplement",
 			},
 			{
 				value: "interval",

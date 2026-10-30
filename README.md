@@ -29,7 +29,7 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llama-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
-- **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡) and generation (🔥) token speed, measured straight from the stream (per token, ~10 updates/s); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
+- **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡, or its time-to-first-token when the prompt is too short/cached to measure a throughput) and generation (🔥) token speed, measured straight from the stream (~10 updates/s, same accounting as trimegisto's `↑prefill ↓decode`); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
 - **Energy cost (💰)** — local models report no per-token cost, so llama-infra estimates the **electricity** the inference consumed: configure each machine's power draw (kW) and tariff (per kWh) once, and every assistant message carries a realistic `usage.cost.total` (kW × €/kWh × measured request time) — pi's native cost footer, session stats and any consumer reading usage (e.g. trimegisto agents) all show it. Currency selector: USD / EUR / GBP / CNY
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled. llama.cpp-family models are registered with the `qwen-chat-template` thinking format, so pi also sends `chat_template_kwargs.enable_thinking` and the **off** level actually stops reasoning (required for halogen, which defaults to `xhigh`)
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
@@ -473,6 +473,7 @@ When enabled, the speed reading appears in the footer's status line (no extra te
 🦙(12) ⚡… 🔥…       (before the first measurement)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (while streaming)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (just after the answer ends — last rates kept)
+🦙(12) ⚡ 561ms   🔥 38.1 t/s  (short/cached prompt: TTFT instead of a fake rate)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (between turns — last rates persisted)
 🦙(12) ▶2 ⚡ 150 t/s 🔥 18.0 t/s  (pi idle, server busy for other clients)
 🦙(12) ⏸ 💰3.2c      (no rate measured yet; energy cost of this session)
@@ -482,7 +483,12 @@ When enabled, the speed reading appears in the footer's status line (no extra te
 
 The footer is **persistent**: llama-infra keeps the last measured prefill/generation rates on the status line instead of clearing them between requests or turns, so the footer stays stable during multi-step agent runs; it only shows the `⚡…`/`🔥…` placeholders before the first measurement and the idle `⏸` when no rate has ever been measured and the server is idle.
 
-- **Client measurement (always, no `--metrics` needed)** — prefill speed = `prompt tokens ÷ (request → first token)` (pi's `usage.input`, OpenAI-style `prompt_tokens` as fallback); generation speed = a moving 1.5 s window over per-token arrival samples. Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
+- **Client measurement (always, no `--metrics` needed)** — both numbers are whole-request averages, the same model trimegisto uses for `↑prefill ↓decode`:
+
+  - **⚡ prefill** = *uncached* prompt tokens (`usage.input + usage.cacheWrite`, i.e. what the engine really processed) ÷ time-to-first-token. That division is only reported as a throughput when the sample is big enough for compute to dominate (**TTFT ≥ 1 s and ≥ 500 prompt tokens**); otherwise — a small prompt, or an engine answering from its **prefix cache** in ~0.5 s while still reporting the full `prompt_tokens` — the footer shows the TTFT itself (`⚡ 561ms`). Without that guard a cached 80k-token prompt reports six figures (real case: `142489 t/s`). The rate is smoothed with an EMA (α = 0.35).
+  - **🔥 generation** = generated tokens ÷ time since the first token. Stream chunks are *not* tokens (one chunk can carry many tokens, and a tool-call fragment is a JSON slice), so live samples use the streamed characters converted with a tokens-per-character ratio learned from the provider's real `usage.output` (default 0.35 tok/char, calibrated after each request); the finished request always uses the authoritative token count. Samples shorter than 400 ms are ignored.
+
+  Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
 - **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown (`▶n`); when the server is idle the last measured client rates stay on the line, and the plain `⏸` reading is only used when no rate has ever been measured.
 
 ## Energy Cost (💰)
@@ -559,7 +565,7 @@ Subsystems:
 
 - **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, ZINC, DwarfStar, lucebox, LM Studio, vLLM, halogen)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
-- **Speed & metrics subsystem** — client-side per-token speed measurement (prefill + moving-window generation), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
+- **Speed & metrics subsystem** — client-side speed measurement (uncached-prefill throughput or TTFT + whole-request generation rate, with a learned chars→tokens ratio), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration
 - **Config persistence** — `~/.pi/agent/llama-infra.json` with one-time migration from `local-models.json`
 - **/proc scanner** — local llama-server process detection for vision, KV cache quant, and drafter flags
