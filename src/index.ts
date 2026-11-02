@@ -414,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 		const next = clampMaxTokensToFit(payload, model.contextWindow);
 		if (next === undefined) return undefined;
 		debugLog(
-			`max_tokens clamp ${payload.max_tokens} → ${next} (prompt ~${est} tok, reserve ${requestReserveTokens(est)}, ctx ${model.contextWindow})`,
+			`max_tokens ${(payload.max_tokens as number) > next ? "clamp" : "raise (summarization)"} ${payload.max_tokens} → ${next} (prompt ~${est} tok, reserve ${requestReserveTokens(est)}, ctx ${model.contextWindow})`,
 		);
 		return { ...payload, max_tokens: next };
 	});

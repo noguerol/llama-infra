@@ -156,6 +156,47 @@ export function requestReserveTokens(estimate: number): number {
 	return Math.max(REQUEST_SAFETY_TOKENS, scaled);
 }
 
+/** Opening line of pi's compaction / branch-summarization system prompt (see
+ *  `SUMMARIZATION_SYSTEM_PROMPT` in pi's `core/compaction/utils`). It is the one
+ *  stable marker of a checkpoint request: pi builds it as a fresh context with a
+ *  single user message holding the serialized transcript and no tools. */
+export const SUMMARIZATION_SYSTEM_PROMPT_MARKER = "You are a context summarization assistant";
+
+/** Concatenate the text of a message `content` (string or array of parts). */
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	let text = "";
+	for (const part of content) {
+		if (typeof part === "string") text += part;
+		else if (part !== null && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+			text += (part as { text: string }).text;
+		}
+	}
+	return text;
+}
+
+/** True when the payload is pi's compaction/branch summarization request.
+ *
+ *  Detected by pi's own summarization system prompt, which no chat request can
+ *  carry by accident (a normal turn's system prompt is pi's agent prompt, even
+ *  when the user pastes text about summarization). Deliberately independent of
+ *  the user payload: the transcript lives in a plain user message. */
+export function isSummarizationPayload(payload: Record<string, unknown>): boolean {
+	const messages = payload.messages;
+	if (!Array.isArray(messages) || messages.length === 0) return false;
+	// Compaction never offers tools; a tool-carrying request is a normal turn.
+	if (Array.isArray(payload.tools) && payload.tools.length > 0) return false;
+	if (typeof payload.system === "string" && payload.system.includes(SUMMARIZATION_SYSTEM_PROMPT_MARKER)) return true;
+	for (const message of messages) {
+		if (message === null || typeof message !== "object") continue;
+		const record = message as { role?: unknown; content?: unknown };
+		if (record.role !== "system" && record.role !== "developer") continue;
+		if (messageText(record.content).includes(SUMMARIZATION_SYSTEM_PROMPT_MARKER)) return true;
+	}
+	return false;
+}
+
 /** Extra headroom kept when retrying an overflow using the prompt size the
  *  server itself reported (a lower bound: "at least N input tokens"). */
 export const OVERFLOW_SAFETY_TOKENS = 4096;
@@ -310,9 +351,20 @@ export function overflowRetryMaxTokens(
  * output plus `requestReserveTokens(estimate)` still fit in the model context
  * window.
  *
- * Returns the clamped value only when it is strictly smaller than the current
- * `max_tokens` (never increases, never forces a value when none was set);
- * otherwise returns undefined so the caller leaves the payload untouched.
+ * Two regimes:
+ *
+ * - Normal turns: only ever LOWERS `max_tokens` (never increases it, never
+ *   forces a value when none was set), and returns undefined when the request
+ *   already fits, so the caller leaves the payload untouched.
+ * - Compaction checkpoints (`isSummarizationPayload`): the value is sized to the
+ *   room the window actually has, which can be ABOVE the current `max_tokens`.
+ *   pi sizes a summary with `model.maxTokens`, and for servers that do not
+ *   announce their own limit that is llama-infra's generation policy
+ *   (`settings.maxOutputTokens`, 32768 by default). A cumulative summary that
+ *   needs more than that policy is cut mid-sentence, pi discards the partial
+ *   checkpoint and the session can never compact again —
+ *   "Summarization failed: generation hit the token cap and the summary is
+ *   incomplete". For a checkpoint the only real limit is the window.
  */
 export function clampMaxTokensToFit(
 	payload: Record<string, unknown>,
@@ -323,6 +375,12 @@ export function clampMaxTokensToFit(
 	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
 	const estimate = estimatePromptTokens(payload);
 	const available = Math.floor(contextWindow - estimate - requestReserveTokens(estimate));
+	if (isSummarizationPayload(payload)) {
+		// Both directions: grow into the free room, shrink when the transcript plus
+		// the reserve no longer fit (the same 400 protection as a normal turn).
+		const fitted = Math.max(1, available);
+		return fitted === current ? undefined : fitted;
+	}
 	const next = Math.max(1, Math.min(current, available));
 	return next < current ? next : undefined;
 }

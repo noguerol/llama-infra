@@ -4,9 +4,11 @@
 import {
 	PROMPT_SAFETY_RATIO,
 	REQUEST_SAFETY_TOKENS,
+	SUMMARIZATION_SYSTEM_PROMPT_MARKER,
 	clampMaxTokensToFit,
 	composeOnPayload,
 	estimatePromptTokens,
+	isSummarizationPayload,
 	requestReserveTokens,
 } from "../src/runtime.ts";
 
@@ -187,6 +189,81 @@ check(
 	"non-positive contextWindow → undefined",
 	clampMaxTokensToFit({ ...baseMessages, max_tokens: 1000 }, 0) === undefined,
 );
+
+// ── summarization (compaction checkpoints) ────────────────────────────────
+// pi sizes a summary with `model.maxTokens`, which for servers that announce no
+// limit is llama-infra's generation policy (32768 by default). A cumulative
+// summary that needs more was cut mid-sentence and pi rejected the checkpoint
+// ("generation hit the token cap and the summary is incomplete"), so the
+// summarization request is allowed to grow into the room the window has.
+
+const summarizationSystem = { role: "system", content: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER}. Your task is to read a conversation ...` };
+const normalSystem = { role: "system", content: "You are pi, a coding agent." };
+const transcript = (chars: number) => ({ role: "user", content: [{ type: "text", text: `<conversation>${"x".repeat(chars)}</conversation>` }] });
+
+check(
+	"detects pi's summarization request (system prompt + single transcript message, no tools)",
+	isSummarizationPayload({ messages: [summarizationSystem, transcript(1000)] }),
+);
+check(
+	"a normal turn is not a summarization request",
+	!isSummarizationPayload({ messages: [normalSystem, transcript(1000)] }),
+);
+check(
+	"a tool-carrying request is never treated as summarization",
+	!isSummarizationPayload({ messages: [summarizationSystem, transcript(1000)], tools: [{ type: "function" }] }),
+);
+check(
+	"the user mentioning summarization does not make a request a checkpoint",
+	!isSummarizationPayload({
+		messages: [normalSystem, { role: "user", content: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER} — what does this do?` }],
+	}),
+);
+check(
+	"anthropic-style top-level `system` is detected too",
+	isSummarizationPayload({ system: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER}.`, messages: [transcript(1000)] }),
+);
+
+// The real failure: 98304-token window, ~34k-token transcript, model cap 32768.
+{
+	const ctx = 98_304;
+	const payload = { messages: [summarizationSystem, transcript(120_000)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check(
+		"summarization: the checkpoint gets more room than the generation policy cap",
+		next !== undefined && next > 32_768,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"summarization: the raised cap still fits (est + next + reserve <= ctx)",
+		next !== undefined && est + next + requestReserveTokens(est) <= ctx,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"summarization: an identical request that already fits is left untouched (undefined)",
+		clampMaxTokensToFit({ ...payload, max_tokens: next }, ctx) === undefined,
+	);
+}
+{
+	// Same prompt as a normal turn -> the policy cap stays untouched.
+	const ctx = 98_304;
+	const payload = { messages: [normalSystem, transcript(120_000)], max_tokens: 32_768 };
+	check("normal turn with the same size keeps the policy cap", clampMaxTokensToFit(payload, ctx) === undefined);
+}
+{
+	// A transcript whose prompt is huge must shrink even for summarization
+	// (400 protection wins over generosity).
+	const ctx = 98_304;
+	const payload = { messages: [summarizationSystem, transcript(300_000)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check(
+		"summarization of an oversized transcript is still clamped to fit",
+		next !== undefined && next < 32_768 && est + next + requestReserveTokens(est) <= ctx,
+		`est=${est} next=${next}`,
+	);
+}
 
 // ── composeOnPayload ──────────────────────────────────────────────────────
 // pi-ai calls onPayload with the final request body (tool schemas included),
