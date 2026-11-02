@@ -572,6 +572,15 @@ Subsystems:
 - **Config persistence** — `~/.pi/agent/llama-infra.json` with one-time migration from `local-models.json`
 - **/proc scanner** — local llama-server process detection for vision, KV cache quant, and drafter flags
 
+## Development
+
+```bash
+# every behavior test is a standalone script (node built-ins only, no install)
+for f in test/*.test.ts; do node --experimental-strip-types "$f" || break; done
+```
+
+`test/no-private-data.test.ts` guards this PUBLIC repo (and runs in CI before any publish): it fails when a tracked file carries an absolute home path, a Tailscale hostname, an API key, a personal e-mail — or anything listed in `sanitize-denylist.local.json`, an optional **git-ignored** file where you list the hostnames and model names of your own machines (`{ "forbid": ["myhost", "Example-27B-Private"] }`). Keep fleet names there, never in the tree: the repo is public, so the guard's own denylist must stay local.
+
 ## Migration from local-models
 
 If you have an existing `~/.pi/agent/local-models.json`, llama-infra migrates it automatically on first run — your servers and settings are preserved. The old `local-models` extension can be removed after migration.

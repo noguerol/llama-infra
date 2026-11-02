@@ -33,6 +33,10 @@ id_rsa*
 *.p12
 *.p8
 credentials*.json
+# Private hygiene guard denylist: hostnames/models of the developer's own fleet.
+# The guard test reads it; it must never be committed or published.
+sanitize-denylist.local.json
+
 # t-plan: plan files are private runtime state — never commit or publish them
 plan_*_[0-9a-zA-Z]*.md
 plan.md

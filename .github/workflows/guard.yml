@@ -1,0 +1,26 @@
+# Private hygiene guard for a PUBLIC package: never publish data that
+# identifies one developer's machine, fleet or models.
+#
+# Runs on every push to main/every manual publish, BEFORE `npm publish`, so a
+# leaked hostname cannot reach the registry (the tree is public too: run it
+# locally with `node --experimental-strip-types test/no-private-data.test.ts`).
+name: Private data guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  no-private-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Same runtime as the local command; no install step needed (the test only
+      # uses node built-ins and `git ls-files`).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Guard tracked files against private data
+        run: node --experimental-strip-types test/no-private-data.test.ts
