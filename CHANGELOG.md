@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Artwork is generated, and carries only the current name and generic labels.** `docs/banner.jpeg` and `docs/preview.jpeg` still said `pi-llamacpp-infra` and labelled a model icon with a specific model family, and being binaries they could not be reviewed or audited by the private-data guard. Both are now produced by `docs/generate-artwork.py` (Pillow, offline, deterministic, system fonts) in the same dark/neon style, with the current `llama-infra` name and generic `model-a.gguf` / `model-b.gguf` / `model-c.gguf` labels; `preview.jpeg` keeps the banner's aspect ratio so the npm card has no empty band. The diagram copy now lives in the diff, so a future change is reviewable and the guard's blind spot shrinks to "whatever the generator prints".
 - `speed.ts` rewritten around per-request state (`requestStart`, `firstTokenAt`, `deltaChars`, live `usage.output`) instead of an arrival-sample window; `⚡` shows a smoothed t/s or a TTFT, `🔥` shows the whole-request average. Measurements (and the learned chars→tokens ratio) are now reset when the active model changes instead of being inherited by the next model.
 
 ## [1.8.2] - 2026-10-30
