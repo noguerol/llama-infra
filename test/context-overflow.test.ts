@@ -25,7 +25,7 @@ function check(label: string, cond: boolean, detail?: string): void {
 
 console.log("context-overflow: parse + retry cap + hard max_tokens");
 
-// ── Real vLLM rejection (luna:200000, prompt 167233, max_tokens 32768) ────
+// ── Real vLLM rejection (200k window, prompt 167233, max_tokens 32768) ────
 const vllmError =
 	'400: {"message":"This model\'s maximum context length is 200000\n tokens. However, you requested 32768 output tokens and your prompt contains\n at least 167233 input tokens, for a total of at least 200001 tokens. Please\n reduce the length of the input prompt or the number of requested output\n tokens. (parameter=input_tokens,\n value=167233)","type":"BadRequestError","param":"input_tokens","code":400}';
 
@@ -121,7 +121,7 @@ async function endToEndOverflowRetry(): Promise<void> {
 			}
 			seen.push(body);
 			if (seen.length === 1) {
-				// Exactly what luna:200000 answered: prompt 167233 + 32768 > 200000.
+				// Exactly what the strict engine answered: prompt 167233 + 32768 > 200000.
 				res.writeHead(400, { "content-type": "application/json" });
 				// OpenAI SDK shape: pi-ai surfaces `error.error` as the 400 body, which is
 				// how the real `400: {"message":…,"param":"input_tokens"}` reached the model.
