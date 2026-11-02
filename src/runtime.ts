@@ -133,10 +133,28 @@ export function toServerRequestModel<T extends { id?: string }>(
 // tens of thousands of tokens, so pi happily sends a request whose
 // prompt + max_tokens exceeds the served context window. Strict engines (vLLM)
 // answer HTTP 400 in that case. The estimate + clamp below keep
-// `prompt + max_tokens + REQUEST_SAFETY_TOKENS <= contextWindow`.
+// `prompt + max_tokens + requestReserveTokens(estimate) <= contextWindow`.
 
-/** Extra tokens reserved for response overhead and estimation error. */
+/** Minimum tokens reserved for response overhead and estimation error. */
 export const REQUEST_SAFETY_TOKENS = 4096;
+
+/** Share of the ESTIMATED PROMPT also kept free on top of the flat reserve.
+ *
+ * The divisors in `estimatePromptTokens` are heuristics, and their error grows
+ * with the payload: on a real vLLM turn the server counted 75318 prompt tokens
+ * where the estimator said 71221 (+5.8%), so the flat 4096-token reserve was
+ * consumed exactly and the request left as `prompt + max_tokens = context + 1`
+ * — the very HTTP 400 this clamp exists to prevent. Reserving a share of the
+ * prompt makes the headroom grow with the quantity being mis-measured, instead
+ * of a fixed budget that one long tool-heavy prompt can eat whole. */
+export const PROMPT_SAFETY_RATIO = 0.1;
+
+/** Headroom to reserve on top of an estimated prompt size: the flat floor, or
+ *  `PROMPT_SAFETY_RATIO` of the estimate, whichever is larger. */
+export function requestReserveTokens(estimate: number): number {
+	const scaled = Number.isFinite(estimate) && estimate > 0 ? Math.ceil(estimate * PROMPT_SAFETY_RATIO) : 0;
+	return Math.max(REQUEST_SAFETY_TOKENS, scaled);
+}
 
 /** Extra headroom kept when retrying an overflow using the prompt size the
  *  server itself reported (a lower bound: "at least N input tokens"). */
@@ -289,7 +307,8 @@ export function overflowRetryMaxTokens(
 
 /**
  * Clamp a request's `max_tokens` so the estimated prompt plus the requested
- * output plus REQUEST_SAFETY_TOKENS still fit in the model context window.
+ * output plus `requestReserveTokens(estimate)` still fit in the model context
+ * window.
  *
  * Returns the clamped value only when it is strictly smaller than the current
  * `max_tokens` (never increases, never forces a value when none was set);
@@ -302,7 +321,8 @@ export function clampMaxTokensToFit(
 	const current = payload.max_tokens;
 	if (typeof current !== "number" || !Number.isFinite(current)) return undefined;
 	if (typeof contextWindow !== "number" || !Number.isFinite(contextWindow) || contextWindow <= 0) return undefined;
-	const available = Math.floor(contextWindow - estimatePromptTokens(payload) - REQUEST_SAFETY_TOKENS);
+	const estimate = estimatePromptTokens(payload);
+	const available = Math.floor(contextWindow - estimate - requestReserveTokens(estimate));
 	const next = Math.max(1, Math.min(current, available));
 	return next < current ? next : undefined;
 }

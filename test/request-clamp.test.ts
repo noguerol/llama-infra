@@ -2,10 +2,12 @@
 // Run: node --experimental-strip-types test/request-clamp.test.ts
 
 import {
+	PROMPT_SAFETY_RATIO,
 	REQUEST_SAFETY_TOKENS,
 	clampMaxTokensToFit,
 	composeOnPayload,
 	estimatePromptTokens,
+	requestReserveTokens,
 } from "../src/runtime.ts";
 
 let failures = 0;
@@ -84,8 +86,8 @@ check(
 	String(oversizedNext),
 );
 check(
-	"clamped request satisfies est + next + REQUEST_SAFETY_TOKENS <= contextWindow",
-	oversizedNext !== undefined && oversizedEstimate + oversizedNext + REQUEST_SAFETY_TOKENS <= oversizedCtx,
+	"clamped request satisfies est + next + reserve <= contextWindow",
+	oversizedNext !== undefined && oversizedEstimate + oversizedNext + requestReserveTokens(oversizedEstimate) <= oversizedCtx,
 	`est=${oversizedEstimate} next=${oversizedNext} ctx=${oversizedCtx}`,
 );
 
@@ -107,10 +109,67 @@ check(
 	String(incidentNext),
 );
 check(
-	"incident: est + next + REQUEST_SAFETY_TOKENS <= 80000",
-	incidentNext !== undefined && incidentEstimate + incidentNext + REQUEST_SAFETY_TOKENS <= incidentCtx,
+	"incident: est + next + reserve <= 80000",
+	incidentNext !== undefined && incidentEstimate + incidentNext + requestReserveTokens(incidentEstimate) <= incidentCtx,
 	`est=${incidentEstimate} next=${incidentNext}`,
 );
+
+// The reserve must scale with the prompt: a fixed 4096 was consumed whole by the
+// estimator's own error on a long tool-heavy turn.
+check(
+	"small prompt → flat floor reserve",
+	requestReserveTokens(1_000) === REQUEST_SAFETY_TOKENS,
+	String(requestReserveTokens(1_000)),
+);
+check(
+	"large prompt → reserve grows with the estimate",
+	requestReserveTokens(80_000) === Math.ceil(80_000 * PROMPT_SAFETY_RATIO) &&
+		requestReserveTokens(80_000) > REQUEST_SAFETY_TOKENS,
+	String(requestReserveTokens(80_000)),
+);
+check("no estimate → floor reserve", requestReserveTokens(0) === REQUEST_SAFETY_TOKENS);
+check("invalid estimate → floor reserve", requestReserveTokens(Number.NaN) === REQUEST_SAFETY_TOKENS);
+
+// Reported vLLM rejection (2026-11): ctx 98304, the server counted 75318 input
+// tokens where the estimator said 71221 (+5.8%), so a request clamped to 22987
+// output tokens landed at 98305 — one over. The clamp must now keep room for a
+// tokenizer that is denser than the estimate.
+const reportedCtx = 98_304;
+const reportedRealPrompt = 75_318;
+const reportedPayload = { messages: [{ role: "user", content: "x".repeat(248_378) }], max_tokens: 32_768 };
+const reportedEstimate = estimatePromptTokens(reportedPayload);
+const reportedNext = clampMaxTokensToFit(reportedPayload, reportedCtx);
+check(
+	"reported incident: the estimate reproduces ~71221 tokens",
+	Math.abs(reportedEstimate - 71_221) <= 5,
+	`est=${reportedEstimate}`,
+);
+check(
+	"reported incident: clamped output + the real prompt count fits the window",
+	reportedNext !== undefined && reportedRealPrompt + reportedNext <= reportedCtx,
+	`next=${reportedNext} total=${reportedRealPrompt + (reportedNext ?? 0)}`,
+);
+
+// Same guarantee across window sizes: a tokenizer that counts 6% more tokens
+// than the estimate (the observed bias) must still fit after the clamp.
+{
+	let ok = true;
+	let detail = "";
+	for (const ctx of [8_192, 32_768, 98_304, 200_000]) {
+		for (const chars of [10_000, 100_000, 200_000, 240_000]) {
+			const payload = { messages: [{ role: "user", content: "x".repeat(chars) }], max_tokens: 32_768 };
+			const est = estimatePromptTokens(payload);
+			const next = clampMaxTokensToFit(payload, ctx) ?? 32_768;
+			const realPrompt = Math.ceil(est * 1.06);
+			if (realPrompt + 1 > ctx) continue; // prompt alone already overflows
+			if (realPrompt + next > ctx) {
+				ok = false;
+				detail = `ctx=${ctx} chars=${chars} est=${est} next=${next} real=${realPrompt}`;
+			}
+		}
+	}
+	check("a 6% denser tokenizer still fits after the clamp (all windows)", ok, detail);
+}
 
 // Never increases, even with ample room.
 check(
@@ -150,8 +209,8 @@ void (async () => {
 			String(out.max_tokens),
 		);
 		check(
-			"composeOnPayload: clamped result satisfies est + next + safety <= ctx",
-			est + out.max_tokens + REQUEST_SAFETY_TOKENS <= clampCtx,
+			"composeOnPayload: clamped result satisfies est + next + reserve <= ctx",
+			est + out.max_tokens + requestReserveTokens(est) <= clampCtx,
 			`est=${est} next=${out.max_tokens}`,
 		);
 	}

@@ -26,7 +26,12 @@ import {
 	thinkingBudgetFieldDisabled,
 	THINKING_BUDGET_FIELD,
 } from "./core.ts";
-import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
+import {
+	clampMaxTokensToFit,
+	createLongTimeoutOpenAICompletionsStream,
+	estimatePromptTokens,
+	requestReserveTokens,
+} from "./runtime.ts";
 import { resolveCostProfile } from "./cost.ts";
 import { createCostTracker, type CostTracker } from "./cost-tracker.ts";
 export { modelOptionsFor };
@@ -409,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 		const next = clampMaxTokensToFit(payload, model.contextWindow);
 		if (next === undefined) return undefined;
 		debugLog(
-			`max_tokens clamp ${payload.max_tokens} → ${next} (prompt ~${est} tok, ctx ${model.contextWindow})`,
+			`max_tokens clamp ${payload.max_tokens} → ${next} (prompt ~${est} tok, reserve ${requestReserveTokens(est)}, ctx ${model.contextWindow})`,
 		);
 		return { ...payload, max_tokens: next };
 	});
