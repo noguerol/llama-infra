@@ -29,6 +29,9 @@ export interface ServerConfig {
 	enabled: boolean;
 	probeDs4?: boolean;
 	apiKey?: string;
+	/** URL scheme used to probe and request this machine (default: "http").
+	 *  "https" for servers proxied behind TLS (e.g. Tailscale serve, Caddy). */
+	protocol?: "http" | "https";
 	/** Energy-cost profile for this machine (kW + tariff). */
 	costProfile?: CostProfile;
 }
