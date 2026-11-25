@@ -201,6 +201,26 @@ export function isSummarizationPayload(payload: Record<string, unknown>): boolea
  *  server itself reported (a lower bound: "at least N input tokens"). */
 export const OVERFLOW_SAFETY_TOKENS = 4096;
 
+/** How many times ONE request may be retried after an overflow rejection.
+ *
+ *  Strict engines report the prompt size they counted, but only as a LOWER
+ *  BOUND (see `OVERFLOW_LOWER_BOUND_SHARE`), so a retry sized from that number
+ *  can still not fit. Each attempt re-reads the fresh report and keeps more
+ *  room free, so a small budget converges instead of surfacing the 400 after
+ *  one try. */
+export const OVERFLOW_MAX_RETRIES = 2;
+
+/** Share of the remaining room kept FREE on a retry whose report is only a
+ *  lower bound for the prompt size.
+ *
+ *  Filling the window exactly is only safe when the count is exact. On a lower
+ *  bound the true prompt is unknown ("at least N"), so the retry must leave a
+ *  fraction of the window unused or it is one longer prompt away from the very
+ *  same 400. The 2026-11 compaction incident: window 262144, report "at least
+ *  47100 input tokens", requested output 215045 — a single retry would still
+ *  have asked for 210948 output tokens. */
+export const OVERFLOW_LOWER_BOUND_SHARE = 0.25;
+
 /** Flat token cost charged per image part (base64 data is never counted). */
 const IMAGE_TOKEN_COST = 1400;
 
@@ -271,10 +291,15 @@ export function estimatePromptTokens(payload: Record<string, unknown>): number {
 	);
 }
 
-/** Prompt size and served window as reported by a strict engine's 400 body. */
+/** Prompt size and served window as reported by a strict engine's 400 body.
+ *
+ *  `inputTokens` is what the engine counted for the prompt, but when
+ *  `lowerBound` is true the body only said "at least N input tokens": the real
+ *  prompt may be longer, so `inputTokens` must never be treated as its size. */
 export interface ContextOverflowReport {
 	inputTokens: number;
 	contextWindow?: number;
+	lowerBound: boolean;
 }
 
 function toTokenCount(raw: string | undefined): number | undefined {
@@ -317,33 +342,78 @@ export function parseContextOverflow(errorText: unknown): ContextOverflowReport 
 		errorText.match(/max(?:imum)?[_ -]?(?:model[_ -]?len|context(?:\s*(?:length|window))?)[^\d]{0,24}([\d,]+)/i) ??
 		errorText.match(/context (?:length|window) (?:of )?([\d,]+)/i) ??
 		errorText.match(/([\d,]+)\s+max[_ -]?model[_ -]?len/i);
-	return { inputTokens, contextWindow: toTokenCount(contextMatch?.[1]) };
+	// vLLM/SGLang phrase the prompt count as a floor: "your prompt contains at
+	// least 167233 input tokens". Treating that number as exact is what made a
+	// previous retry overflow again with a longer prompt.
+	const lowerBound = /\bat least\b|\bminimum of\b|≥|>=/i.test(errorText);
+	return { inputTokens, contextWindow: toTokenCount(contextMatch?.[1]), lowerBound };
 }
 
 /**
- * Compute the `max_tokens` to use for ONE retry after a context-overflow 400.
+ * Compute the `max_tokens` to use for the NEXT retry after a context-overflow
+ * 400.
  *
- * The server reports how many prompt tokens it actually counted, so the retry
- * fits exactly: `reported prompt + max_tokens + OVERFLOW_SAFETY_TOKENS <= ctx`.
+ * The server reports how many prompt tokens it counted, so the retry can be
+ * sized from it: `reported prompt + max_tokens + reserve <= ctx`. Two details
+ * keep that honest:
+ *
+ * - When the body said "at least N input tokens" the count is only a floor, so
+ *   a share of the remaining room (`OVERFLOW_LOWER_BOUND_SHARE`) is kept free
+ *   instead of filling the window to the last token.
+ * - `attempt` (0 = the first retry) grows the flat reserve, so a retry that
+ *   overflowed again lands strictly smaller and the remaining attempts
+ *   (`OVERFLOW_MAX_RETRIES`) can converge.
+ *
  * Returns undefined when the error is not an overflow, when no window is known,
- * or when the cap would not actually shrink the request (nothing to gain).
+ * when the retry budget is spent, or when the cap would not actually shrink the
+ * request (nothing to gain).
  */
 export function overflowRetryMaxTokens(
 	errorText: unknown,
 	contextWindow?: number,
 	currentMaxTokens?: number,
+	attempt = 0,
 ): number | undefined {
 	const report = parseContextOverflow(errorText);
 	if (report === undefined) return undefined;
+	const tried = Number.isFinite(attempt) && attempt > 0 ? Math.floor(attempt) : 0;
+	if (tried >= OVERFLOW_MAX_RETRIES) return undefined;
 	const ctx = report.contextWindow ?? contextWindow;
 	if (typeof ctx !== "number" || !Number.isFinite(ctx) || ctx <= 0) return undefined;
-	const cap = Math.max(1, Math.floor(ctx - report.inputTokens - OVERFLOW_SAFETY_TOKENS));
+	// A prompt that already exceeds the window on its own cannot be fixed by
+	// asking for less output: the retry would be a guaranteed second 400, so the
+	// error must surface and the prompt get shortened instead.
+	if (report.inputTokens >= ctx) return undefined;
+	const reserve = OVERFLOW_SAFETY_TOKENS * (tried + 1);
+	const room = ctx - report.inputTokens - reserve;
+	const usable = report.lowerBound ? Math.floor(room * (1 - OVERFLOW_LOWER_BOUND_SHARE)) : room;
+	const cap = Math.max(1, usable);
 	if (cap >= ctx) return undefined;
 	if (typeof currentMaxTokens === "number" && Number.isFinite(currentMaxTokens) && cap >= currentMaxTokens) {
 		// The request already asked for less than the fit: a retry would repeat it.
 		return undefined;
 	}
 	return cap;
+}
+
+/**
+ * Ceiling for a checkpoint's `max_tokens`.
+ *
+ * A summary is a distillation of the transcript it summarizes, so asking for
+ * MORE output tokens than the (estimated) transcript is never useful. Without
+ * this ceiling a checkpoint request grows to the last free token of the window
+ * — on a 262144-token window the 2026-11 compaction asked for 215045 output
+ * tokens, which left only 47100 for a prompt the estimator had under-counted at
+ * ~42800; vLLM counted more and answered 400.
+ *
+ * The generation policy (`settings.maxOutputTokens`, what pi sends as
+ * `model.maxTokens`) is always allowed: it is a deliberate choice, not an
+ * estimate.
+ */
+export function summarizationOutputCeiling(currentMaxTokens: number, estimate: number): number {
+	const policy = Number.isFinite(currentMaxTokens) && currentMaxTokens > 0 ? currentMaxTokens : 1;
+	const transcript = Number.isFinite(estimate) && estimate > 0 ? estimate : 0;
+	return Math.max(1, Math.max(policy, transcript));
 }
 
 /**
@@ -364,7 +434,8 @@ export function overflowRetryMaxTokens(
  *   needs more than that policy is cut mid-sentence, pi discards the partial
  *   checkpoint and the session can never compact again —
  *   "Summarization failed: generation hit the token cap and the summary is
- *   incomplete". For a checkpoint the only real limit is the window.
+ *   incomplete". For a checkpoint the limit is the window, bounded by
+ *   `summarizationOutputCeiling` so it never swallows the whole of it.
  */
 export function clampMaxTokensToFit(
 	payload: Record<string, unknown>,
@@ -376,9 +447,10 @@ export function clampMaxTokensToFit(
 	const estimate = estimatePromptTokens(payload);
 	const available = Math.floor(contextWindow - estimate - requestReserveTokens(estimate));
 	if (isSummarizationPayload(payload)) {
-		// Both directions: grow into the free room, shrink when the transcript plus
-		// the reserve no longer fit (the same 400 protection as a normal turn).
-		const fitted = Math.max(1, available);
+		// Both directions: grow into the free room (never past the checkpoint
+		// ceiling), shrink when the transcript plus the reserve no longer fit (the
+		// same 400 protection as a normal turn).
+		const fitted = Math.max(1, Math.min(available, summarizationOutputCeiling(current, estimate)));
 		return fitted === current ? undefined : fitted;
 	}
 	const next = Math.max(1, Math.min(current, available));
@@ -539,98 +611,108 @@ export function createLongTimeoutOpenAICompletionsStream(model: any, context: an
 				return withLocalRuntimeDefaults({ ...options, onPayload }, activeRequestTimeoutMs());
 			};
 
-			const runStream = async (streamModel: any, streamOptions: Record<string, any>) => {
-				const stream = streamSimple(streamModel, context, streamOptions);
-				let errored = false;
-				for await (const event of stream) {
-					if (event?.type === "error") errored = true;
-					out.push(event);
-				}
-				if (typeof stream.result === "function") out.end(await stream.result());
-				else out.end();
-				return errored;
-			};
-
-			let inner = streamSimple(requestModel, context, buildOptions());
-			const iterator = inner[Symbol.asyncIterator]();
-
 			// pi-ai emits `start` before the response is read, so an HTTP 400 arrives as
-			// `start` → `error`. Buffer events until the stream either fails or really
-			// starts producing content (a 400 never produces content), which keeps the
-			// decision reversible without delaying visible output.
-			const buffered: any[] = [];
-			let rejection: string | undefined;
-			let overflowCap: number | undefined;
+			// `start` → `error`. Every attempt buffers events until the stream either
+			// fails or really starts producing content (a 400 never produces content),
+			// which keeps the retry decision reversible without delaying visible output.
+			// Each retry is sized from the LATEST error report and keeps more room free,
+			// so an engine that only reported a lower bound cannot defeat it forever.
+			let retryModel = requestModel;
+			let hardMaxTokens: number | undefined;
+			let stripFields: string[] | undefined;
+			let overflowRetries = 0;
+			let strippedBudgetField = false;
+			let strippedFieldName: string | undefined;
+
 			for (;;) {
-				const next = await iterator.next();
-				if (next.done) break;
-				const event = next.value;
-				buffered.push(event);
-				if (event?.type === "error") {
+				const stream = streamSimple(retryModel, context, buildOptions(stripFields, hardMaxTokens));
+				const iterator = stream[Symbol.asyncIterator]();
+				const buffered: any[] = [];
+				/** Flush what was buffered, drain the rest and close the stream. */
+				const finish = async () => {
+					for (const event of buffered) out.push(event);
+					for (;;) {
+						const next = await iterator.next();
+						if (next.done) break;
+						out.push(next.value);
+					}
+					if (typeof stream.result === "function") out.end(await stream.result());
+					else out.end();
+				};
+
+				let errorEvent: any;
+				for (;;) {
+					const next = await iterator.next();
+					if (next.done) break;
+					const event = next.value;
+					buffered.push(event);
+					if (event?.type === "error") {
+						errorEvent = event;
+						break;
+					}
+					if (event?.type !== "start") break; // real content → no retry
+				}
+
+				if (errorEvent !== undefined) {
+					const errorText = errorTextOf(errorEvent);
 					// Self-healing #1: strict engines (vLLM/SGLang) answer HTTP 400 when
 					// prompt + max_tokens exceeds the served window. Their body reports the
-					// prompt size they counted, so retry ONCE with a max_tokens that fits.
-					// This is checked before the budget-field self-heal: an overflow is
-					// unambiguous, so the single retry is spent where it can help.
-					overflowCap = overflowRetryMaxTokens(errorTextOf(event), contextWindow, sentMaxTokens);
-					if (overflowCap === undefined) {
-						// Self-healing #2: some engines (strict Python/vLLM-fork native workers)
-						// reject the thinking-budget field with HTTP 400 instead of ignoring it.
-						// Retry ONCE without any budget field, and only keep the opt-out when
-						// the retry works — unrelated 400s (bad tools) are surfaced untouched.
-						rejection = budgetFieldRejection(event, sentBudgetFields);
+					// prompt size they counted — usually as a lower bound — so retry with a
+					// max_tokens that fits, keeping a share of the window free.
+					const cap = overflowRetryMaxTokens(errorText, contextWindow, sentMaxTokens, overflowRetries);
+					if (cap !== undefined) {
+						overflowRetries += 1;
+						hardMaxTokens = cap;
+						debugLog(
+							`context overflow on ${model?.id}: retry ${overflowRetries}/${OVERFLOW_MAX_RETRIES} with max_tokens ${sentMaxTokens ?? "?"} → ${cap}: ${errorText}`,
+						);
+						continue;
 					}
-					break;
+					// Self-healing #2: some engines (strict Python/vLLM-fork native workers)
+					// reject the thinking-budget field with HTTP 400 instead of ignoring it.
+					// Retry ONCE without any budget field, and only keep the opt-out when
+					// the retry works — unrelated 400s (bad tools) are surfaced untouched.
+					const rejection = strippedBudgetField ? undefined : budgetFieldRejection(errorEvent, sentBudgetFields);
+					if (rejection !== undefined) {
+						const configured = configuredBudgetField(retryModel) ?? configuredBudgetField(model);
+						debugLog(`thinking-budget field rejected by ${model?.id} (${rejection}): ${errorText}`);
+						const strip = configured ? [...THINKING_BUDGET_FIELDS, configured] : THINKING_BUDGET_FIELDS;
+						retryModel = {
+							...retryModel,
+							compat: {
+								...(retryModel?.compat ?? {}),
+								thinkingTokenBudgetField: false,
+								supportsThinkingTokenBudget: false,
+							},
+						};
+						stripFields = strip;
+						strippedBudgetField = true;
+						strippedFieldName = configured;
+						continue;
+					}
+					// Nothing to heal: surface the error exactly as the engine sent it.
+					await finish();
+					return;
 				}
-				if (event?.type !== "start") break; // real content → no retry
-			}
 
-			if (overflowCap !== undefined) {
-				debugLog(
-					`context overflow on ${model?.id}: retrying once with max_tokens ${sentMaxTokens ?? "?"} → ${overflowCap}: ${errorTextOf(buffered[buffered.length - 1])}`,
-				);
-				const retryErrored = await runStream(requestModel, buildOptions(undefined, overflowCap));
-				if (!retryErrored) {
+				// Real content (or a clean end): stream it out and close.
+				if (overflowRetries > 0) {
 					console.error(
-						`[llama-infra] ${model?.id ?? "model"} rejected the request (prompt + max_tokens exceed the context window); retried with max_tokens=${overflowCap} and succeeded.`,
+						`[llama-infra] ${model?.id ?? "model"} rejected the request (prompt + max_tokens exceed the context window); retried with max_tokens=${sentMaxTokens ?? "?"} (attempt ${overflowRetries}/${OVERFLOW_MAX_RETRIES}) and succeeded.`,
 					);
 				}
-				return;
-			}
-
-			if (rejection) {
-				const configured = configuredBudgetField(requestModel) ?? configuredBudgetField(model);
-				debugLog(`thinking-budget field rejected by ${model?.id} (${rejection}): ${errorTextOf(buffered[buffered.length - 1])}`);
-				const retryModel = {
-					...requestModel,
-					compat: {
-						...(requestModel?.compat ?? {}),
-						thinkingTokenBudgetField: false,
-						supportsThinkingTokenBudget: false,
-					},
-				};
-				const strip = configured ? [...THINKING_BUDGET_FIELDS, configured] : THINKING_BUDGET_FIELDS;
-				const retryErrored = await runStream(retryModel, buildOptions(strip));
-				if (!retryErrored) {
+				if (strippedBudgetField) {
 					console.error(
-						`[llama-infra] ${model?.id ?? "model"} rejected the thinking-budget field${configured ? ` (${configured})` : ""}; retried without it and saved the opt-out (\"thinkingBudgetField\": false).`,
+						`[llama-infra] ${model?.id ?? "model"} rejected the thinking-budget field; retried without it and saved the opt-out ("thinkingBudgetField": false).`,
 					);
 					disableThinkingBudgetField(model?.id);
 					// The persisted config applies on the next scan; this keeps the current
 					// session from resending (and re-failing) on every following turn.
 					disableBudgetFieldOnModel(model);
 				}
+				await finish();
 				return;
 			}
-
-			for (const event of buffered) out.push(event);
-			for (;;) {
-				const next = await iterator.next();
-				if (next.done) break;
-				out.push(next.value);
-			}
-			if (typeof inner.result === "function") out.end(await inner.result());
-			else out.end();
 		} catch (err) {
 			const message = err instanceof Error ? err.message : String(err);
 			out.push({

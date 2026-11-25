@@ -2,6 +2,8 @@
 // Run: node --experimental-strip-types test/context-overflow.test.ts
 
 import {
+	OVERFLOW_LOWER_BOUND_SHARE,
+	OVERFLOW_MAX_RETRIES,
 	OVERFLOW_SAFETY_TOKENS,
 	composeOnPayload,
 	createLongTimeoutOpenAICompletionsStream,
@@ -32,6 +34,7 @@ const vllmError =
 const report = parseContextOverflow(vllmError);
 check("parses the reported prompt size", report?.inputTokens === 167_233, String(report?.inputTokens));
 check("parses the served context window", report?.contextWindow === 200_000, String(report?.contextWindow));
+check("marks the reported prompt as a LOWER BOUND (vLLM says \"at least\")", report?.lowerBound === true, String(report?.lowerBound));
 
 const cap = overflowRetryMaxTokens(vllmError, 200_000, 32_768);
 check(
@@ -40,6 +43,27 @@ check(
 	String(cap),
 );
 check("retry cap is below the max_tokens that failed", cap !== undefined && cap < 32_768, String(cap));
+// A lower bound is not a size: the retry must not fill the window to the last
+// token, or a longer prompt lands on the same 400 again.
+check(
+	"retry on a lower bound keeps a share of the room free",
+	cap !== undefined &&
+		cap <= Math.floor((200_000 - 167_233 - OVERFLOW_SAFETY_TOKENS) * (1 - OVERFLOW_LOWER_BOUND_SHARE)),
+	String(cap),
+);
+
+// Retries are bounded and each one asks for strictly less than the previous.
+const secondCap = overflowRetryMaxTokens(vllmError, 200_000, cap, 1);
+check(
+	"a second retry shrinks further (larger reserve)",
+	cap !== undefined && secondCap !== undefined && secondCap < cap,
+	`first=${cap} second=${secondCap}`,
+);
+check(
+	"the retry budget is finite",
+	overflowRetryMaxTokens(vllmError, 200_000, secondCap, OVERFLOW_MAX_RETRIES) === undefined,
+	String(overflowRetryMaxTokens(vllmError, 200_000, secondCap, OVERFLOW_MAX_RETRIES)),
+);
 
 // Already asking for less than the fit → a retry would just repeat the request.
 check(
@@ -52,6 +76,7 @@ const sglangError = "The prompt is too long: 210000 input tokens > 200000 max_mo
 const sg = parseContextOverflow(sglangError);
 check("parses '<N> input tokens' phrasing", sg?.inputTokens === 210_000, String(sg?.inputTokens));
 check("parses max_model_len as the window", sg?.contextWindow === 200_000, String(sg?.contextWindow));
+check("an exact count is not a lower bound", sg?.lowerBound === false, String(sg?.lowerBound));
 
 const commas = parseContextOverflow("maximum context length is 262,144 tokens; prompt tokens: 250,000");
 check("parses thousands separators", commas?.inputTokens === 250_000 && commas.contextWindow === 262_144, JSON.stringify(commas));
@@ -61,6 +86,12 @@ const noWindow = overflowRetryMaxTokens("prompt is too long: 6000 input tokens",
 check(
 	"falls back to the model contextWindow",
 	noWindow !== undefined && 6000 + noWindow + OVERFLOW_SAFETY_TOKENS <= 16_384,
+	String(noWindow),
+);
+// An exact count fills the remaining room: only the flat reserve is kept.
+check(
+	"an exact prompt count keeps only the flat reserve free",
+	noWindow === 16_384 - 6000 - OVERFLOW_SAFETY_TOKENS,
 	String(noWindow),
 );
 
@@ -76,6 +107,11 @@ for (const text of unrelated) {
 	check(`not an overflow: ${text.slice(0, 42)}`, parseContextOverflow(text) === undefined);
 }
 check("no window at all → no retry", overflowRetryMaxTokens("prompt is too long: 6000 input tokens", undefined, 4096) === undefined);
+// The prompt alone overflows the window: shrinking the output cannot help.
+check(
+	"prompt already over the window → no retry",
+	overflowRetryMaxTokens("prompt is too long: 140000 tokens > 98304 maximum", 98_304, 8192) === undefined,
+);
 check("empty error → no retry", overflowRetryMaxTokens("", 200_000, 4096) === undefined);
 
 // ── composeOnPayload hard ceiling (the retry's lever) ────────────────────
@@ -98,6 +134,7 @@ void (async () => {
 	check("zero hard cap is ignored", (await composeOnPayload(undefined, ctx, undefined, 0)({ ...fitting, max_tokens: 5 }, { id: "m" })).max_tokens === 5);
 
 	await endToEndOverflowRetry();
+	await endToEndRepeatedOverflowRetry();
 
 	if (failures > 0) {
 		console.error(`context-overflow tests failed: ${failures}`);
@@ -205,14 +242,141 @@ async function endToEndOverflowRetry(): Promise<void> {
 		check("e2e: exactly two requests were sent", seen.length === 2, String(seen.length));
 		check("e2e: the first request asked for the failing max_tokens", seen[0]?.max_tokens === 32_768, String(seen[0]?.max_tokens));
 		check(
-			"e2e: the retry asks for the max_tokens that fits the reported prompt",
-			seen[1]?.max_tokens === 200_000 - 167_233 - OVERFLOW_SAFETY_TOKENS,
+			"e2e: the retry asks for a max_tokens that fits the reported prompt",
+			seen[1]?.max_tokens ===
+				Math.floor((200_000 - 167_233 - OVERFLOW_SAFETY_TOKENS) * (1 - OVERFLOW_LOWER_BOUND_SHARE)),
 			String(seen[1]?.max_tokens),
 		);
 		check(
 			"e2e: the retry keeps model and messages intact",
 			seen[1]?.model === "qwen" && Array.isArray(seen[1]?.messages),
 			JSON.stringify(seen[1] ?? {}).slice(0, 200),
+		);
+	} finally {
+		server.close();
+	}
+}
+
+// ── End-to-end: the retry still does not fit ("at least" is a lower bound) ──
+// The 2026-11 compaction incident: window 262144, the server counted "at least
+// 47100 input tokens" while the client kept asking for most of the window. One
+// retry sized from that floor can overflow again, so a fresh attempt is made
+// with a smaller cap instead of surfacing the 400.
+async function endToEndRepeatedOverflowRetry(): Promise<void> {
+	const ctx = 262_144;
+	const firstPrompt = 47_100;
+	const secondPrompt = 60_000;
+	const seen: Array<Record<string, any>> = [];
+	const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+		let raw = "";
+		req.on("data", (piece) => (raw += piece));
+		req.on("end", () => {
+			let body: Record<string, any> = {};
+			try {
+				body = JSON.parse(raw || "{}");
+			} catch {
+				// ignore
+			}
+			seen.push(body);
+			const reported = seen.length === 1 ? firstPrompt : seen.length === 2 ? secondPrompt : undefined;
+			if (reported !== undefined) {
+				res.writeHead(400, { "content-type": "application/json" });
+				res.end(
+					JSON.stringify({
+						error: {
+							message: `This model's maximum context length is ${ctx} tokens. However, you requested ${body.max_tokens} output tokens and your prompt contains at least ${reported} input tokens, for a total of at least ${reported + body.max_tokens} tokens. (parameter=input_tokens, value=${reported})`,
+							type: "BadRequestError",
+							param: "input_tokens",
+							code: 400,
+						},
+					}),
+				);
+				return;
+			}
+			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+			const chunk = (delta: unknown, finish: string | null) =>
+				`data: ${JSON.stringify({
+					id: "chatcmpl-test",
+					object: "chat.completion.chunk",
+					created: 1,
+					model: "qwen",
+					choices: [{ index: 0, delta, finish_reason: finish }],
+				})}\n\n`;
+			res.write(chunk({ role: "assistant", content: "resumen" }, null));
+			res.write(chunk({}, "stop"));
+			res.write("data: [DONE]\n\n");
+			res.end();
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const port = (server.address() as { port: number }).port;
+
+	try {
+		const modelId = `qwen (127.0.0.1:${port})`;
+		const config: InfraConfig = { servers: [], settings: { ...DEFAULT_SETTINGS }, modelOptions: {} };
+		setActiveConfig(config);
+		shared.serverModelIds.clear();
+		shared.compactModelIds.clear();
+		shared.modelBaseUrls.clear();
+		shared.endpointKinds.clear();
+		shared.serverModelIds.set(modelId, "qwen");
+		shared.compactModelIds.set("qwen", modelId);
+		shared.modelBaseUrls.set(modelId, `http://127.0.0.1:${port}/v1`);
+
+		// The incident shape: the first request asks for most of the window.
+		const incidentMax = 215_045;
+		const model: any = {
+			id: modelId,
+			name: "qwen",
+			api: "openai-completions",
+			provider: "llama-infra",
+			baseUrl: `http://127.0.0.1:${port}/v1`,
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: ctx,
+			maxTokens: incidentMax,
+			compat: { maxTokensField: "max_tokens", supportsUsageInStreaming: true, supportsStrictMode: false },
+		};
+		shared.lastModels = [model];
+
+		const events: any[] = [];
+		const stream = createLongTimeoutOpenAICompletionsStream(
+			model,
+			{ messages: [{ role: "user", content: "hola" }] },
+			{ apiKey: "no-auth", maxTokens: incidentMax },
+		);
+		for await (const event of stream) events.push(event);
+		await stream.result();
+
+		check(
+			"e2e-repeated: the turn completes after two overflow rejections",
+			events.filter((e) => e?.type === "error").length === 0,
+			JSON.stringify(events.filter((e) => e?.type === "error")).slice(0, 300),
+		);
+		check("e2e-repeated: three requests were sent (original + 2 retries)", seen.length === 3, String(seen.length));
+		check(
+			"e2e-repeated: the first request asked for the window-filling max_tokens",
+			seen[0]?.max_tokens === incidentMax,
+			String(seen[0]?.max_tokens),
+		);
+		const cap1 = Math.floor((ctx - firstPrompt - OVERFLOW_SAFETY_TOKENS) * (1 - OVERFLOW_LOWER_BOUND_SHARE));
+		const cap2 = Math.floor((ctx - secondPrompt - 2 * OVERFLOW_SAFETY_TOKENS) * (1 - OVERFLOW_LOWER_BOUND_SHARE));
+		check("e2e-repeated: the first retry keeps a share of the window free", seen[1]?.max_tokens === cap1, String(seen[1]?.max_tokens));
+		check(
+			"e2e-repeated: the second retry shrinks again from the newer, larger floor",
+			seen[2]?.max_tokens === cap2 && cap2 < cap1,
+			`${seen[2]?.max_tokens} vs ${cap1}`,
+		);
+		check(
+			"e2e-repeated: every request plus the reported prompt fits the window",
+			secondPrompt + (seen[2]?.max_tokens ?? ctx) <= ctx,
+			String(secondPrompt + (seen[2]?.max_tokens ?? 0)),
+		);
+		check(
+			"e2e-repeated: the answer is streamed after the retries",
+			events.some((e) => e?.type === "text_delta" && e.delta === "resumen"),
+			JSON.stringify(events.map((e) => e.type)),
 		);
 	} finally {
 		server.close();

@@ -10,6 +10,7 @@ import {
 	estimatePromptTokens,
 	isSummarizationPayload,
 	requestReserveTokens,
+	summarizationOutputCeiling,
 } from "../src/runtime.ts";
 
 let failures = 0;
@@ -263,6 +264,42 @@ check(
 		next !== undefined && next < 32_768 && est + next + requestReserveTokens(est) <= ctx,
 		`est=${est} next=${next}`,
 	);
+}
+{
+	// 2026-11 compaction incident: window 262144 and a transcript the estimator
+	// sizes at ~42800 tokens. The clamp used to grow the checkpoint to the last
+	// free token of the window (pi asked 215045 output tokens); vLLM then counted
+	// 47100 prompt tokens and answered 400. A summary must never ask for more
+	// output tokens than the transcript it summarizes.
+	const ctx = 262_144;
+	const payload = { messages: [summarizationSystem, transcript(148_963)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check("incident: the transcript estimates ~42800 tokens", Math.abs(est - 42_817) <= 60, `est=${est}`);
+	check(
+		"incident: the checkpoint output never exceeds the transcript estimate",
+		next !== undefined && next <= est,
+		`next=${next} est=${est}`,
+	);
+	check(
+		"incident: the request keeps most of the window free",
+		est + (next ?? 0) + requestReserveTokens(est) <= ctx / 2,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"incident: a second pass over the same payload is a no-op",
+		clampMaxTokensToFit({ ...payload, max_tokens: next }, ctx) === undefined,
+	);
+}
+{
+	// The ceiling never goes below pi's generation policy, and a short transcript
+	// is not raised into the window just because the room is there.
+	const ctx = 262_144;
+	const payload = { messages: [summarizationSystem, transcript(4_000)], max_tokens: 32_768 };
+	check("a short transcript keeps the generation policy cap", clampMaxTokensToFit(payload, ctx) === undefined);
+	check("ceiling: policy is always allowed", summarizationOutputCeiling(32_768, 100) === 32_768);
+	check("ceiling: a bigger transcript allows more", summarizationOutputCeiling(32_768, 42_817) === 42_817);
+	check("ceiling: invalid values fall back to the policy/1", summarizationOutputCeiling(0, Number.NaN) === 1);
 }
 
 // ── composeOnPayload ──────────────────────────────────────────────────────
