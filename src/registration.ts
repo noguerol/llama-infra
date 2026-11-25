@@ -10,6 +10,7 @@ import {
 	modelOptions,
 	modelOptionsFor,
 	saveConfig,
+	serverBaseUrl,
 	saveModelsCache,
 	shared,
 } from "./core.ts";
@@ -284,7 +285,7 @@ export function buildAndRegisterProvider(
 
 	const first = config.servers.find((s) => s.enabled && s.ports.length > 0);
 	const defaultBaseUrl =
-		scan.endpoints.find((e) => e.ok)?.baseUrl ?? `http://${first?.host ?? "127.0.0.1"}:${first?.ports[0] ?? 8080}/v1`;
+		scan.endpoints.find((e) => e.ok)?.baseUrl ?? (first ? serverBaseUrl(first, first.ports[0] ?? 8080) : "http://127.0.0.1:8080/v1");
 	const defaultApiKey = first?.apiKey || DEFAULT_API_KEY;
 
 	try {
@@ -299,7 +300,10 @@ export function buildAndRegisterProvider(
 		apiKey: defaultApiKey,
 		api: "openai-completions",
 		streamSimple: createLongTimeoutOpenAICompletionsStream,
-		models: piModels,
+		// `compat.thinkingTokenBudgetField: false` is pi's documented runtime
+		// opt-out ("Default: false"), but its TS type only allows the field-name
+		// union → cast the models array here.
+		models: piModels as any,
 	});
 
 	// Persist the last known good models so a fresh pi process can register them

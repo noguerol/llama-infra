@@ -2,10 +2,15 @@
 // Run: node --experimental-strip-types test/request-clamp.test.ts
 
 import {
+	PROMPT_SAFETY_RATIO,
 	REQUEST_SAFETY_TOKENS,
+	SUMMARIZATION_SYSTEM_PROMPT_MARKER,
 	clampMaxTokensToFit,
 	composeOnPayload,
 	estimatePromptTokens,
+	isSummarizationPayload,
+	requestReserveTokens,
+	summarizationOutputCeiling,
 } from "../src/runtime.ts";
 
 let failures = 0;
@@ -24,8 +29,8 @@ console.log("request-clamp: tools-aware max_tokens clamp");
 const shortEstimate = estimatePromptTokens({ messages: [{ role: "user", content: "hi" }] });
 const longEstimate = estimatePromptTokens({ messages: [{ role: "user", content: "x".repeat(4000) }] });
 check(
-	"estimate scales with message text length (≈chars/4)",
-	longEstimate - shortEstimate >= 900 && longEstimate - shortEstimate <= 1100,
+	"estimate scales with message text length (≈chars/3.5)",
+	longEstimate - shortEstimate >= 1100 && longEstimate - shortEstimate <= 1200,
 	`short=${shortEstimate} long=${longEstimate}`,
 );
 
@@ -42,9 +47,9 @@ const toolsJsonChars = JSON.stringify(bigTools).length;
 const withToolsEstimate = estimatePromptTokens({ ...baseMessages, tools: bigTools });
 const toolsDelta = withToolsEstimate - estimatePromptTokens(baseMessages);
 check(
-	"adding a large tools array raises the estimate by ≈JSON chars/3.5",
-	Math.abs(toolsDelta - Math.ceil(toolsJsonChars / 3.5)) <= 2,
-	`delta=${toolsDelta} json/3.5=${Math.ceil(toolsJsonChars / 3.5)}`,
+	"adding a large tools array raises the estimate by ≈JSON chars/3",
+	Math.abs(toolsDelta - Math.ceil(toolsJsonChars / 3)) <= 2,
+	`delta=${toolsDelta} json/3=${Math.ceil(toolsJsonChars / 3)}`,
 );
 
 const imageMessage = {
@@ -84,20 +89,20 @@ check(
 	String(oversizedNext),
 );
 check(
-	"clamped request satisfies est + next + REQUEST_SAFETY_TOKENS <= contextWindow",
-	oversizedNext !== undefined && oversizedEstimate + oversizedNext + REQUEST_SAFETY_TOKENS <= oversizedCtx,
+	"clamped request satisfies est + next + reserve <= contextWindow",
+	oversizedNext !== undefined && oversizedEstimate + oversizedNext + requestReserveTokens(oversizedEstimate) <= oversizedCtx,
 	`est=${oversizedEstimate} next=${oversizedNext} ctx=${oversizedCtx}`,
 );
 
-// Reported incident: ~71809-token prompt, 80k context, 8192 requested output.
-// content length 286208 + role "user" (4) = 286212 chars → ceil/4 = 71553,
-// + 256 overhead = 71809 estimated prompt tokens.
-const incident = { messages: [{ role: "user", content: "x".repeat(286_208) }], max_tokens: 8192 };
+// Historical incident shape: ~250k-char tool-heavy prompt, 80k context,
+// 8192 requested output. The estimator (chars/3.5 + 256) reports ~71685
+// tokens, so the clamp must shrink max_tokens for the request to fit.
+const incident = { messages: [{ role: "user", content: "x".repeat(250_000) }], max_tokens: 8192 };
 const incidentCtx = 80_000;
 const incidentEstimate = estimatePromptTokens(incident);
 check(
-	"incident payload estimates ~71809 tokens",
-	Math.abs(incidentEstimate - 71_809) <= 1,
+	"incident payload estimates ~71685 tokens",
+	Math.abs(incidentEstimate - 71_685) <= 100,
 	`estimate=${incidentEstimate}`,
 );
 const incidentNext = clampMaxTokensToFit(incident, incidentCtx);
@@ -107,10 +112,67 @@ check(
 	String(incidentNext),
 );
 check(
-	"incident: est + next + REQUEST_SAFETY_TOKENS <= 80000",
-	incidentNext !== undefined && incidentEstimate + incidentNext + REQUEST_SAFETY_TOKENS <= incidentCtx,
+	"incident: est + next + reserve <= 80000",
+	incidentNext !== undefined && incidentEstimate + incidentNext + requestReserveTokens(incidentEstimate) <= incidentCtx,
 	`est=${incidentEstimate} next=${incidentNext}`,
 );
+
+// The reserve must scale with the prompt: a fixed 4096 was consumed whole by the
+// estimator's own error on a long tool-heavy turn.
+check(
+	"small prompt → flat floor reserve",
+	requestReserveTokens(1_000) === REQUEST_SAFETY_TOKENS,
+	String(requestReserveTokens(1_000)),
+);
+check(
+	"large prompt → reserve grows with the estimate",
+	requestReserveTokens(80_000) === Math.ceil(80_000 * PROMPT_SAFETY_RATIO) &&
+		requestReserveTokens(80_000) > REQUEST_SAFETY_TOKENS,
+	String(requestReserveTokens(80_000)),
+);
+check("no estimate → floor reserve", requestReserveTokens(0) === REQUEST_SAFETY_TOKENS);
+check("invalid estimate → floor reserve", requestReserveTokens(Number.NaN) === REQUEST_SAFETY_TOKENS);
+
+// Reported vLLM rejection (2026-11): ctx 98304, the server counted 75318 input
+// tokens where the estimator said 71221 (+5.8%), so a request clamped to 22987
+// output tokens landed at 98305 — one over. The clamp must now keep room for a
+// tokenizer that is denser than the estimate.
+const reportedCtx = 98_304;
+const reportedRealPrompt = 75_318;
+const reportedPayload = { messages: [{ role: "user", content: "x".repeat(248_378) }], max_tokens: 32_768 };
+const reportedEstimate = estimatePromptTokens(reportedPayload);
+const reportedNext = clampMaxTokensToFit(reportedPayload, reportedCtx);
+check(
+	"reported incident: the estimate reproduces ~71221 tokens",
+	Math.abs(reportedEstimate - 71_221) <= 5,
+	`est=${reportedEstimate}`,
+);
+check(
+	"reported incident: clamped output + the real prompt count fits the window",
+	reportedNext !== undefined && reportedRealPrompt + reportedNext <= reportedCtx,
+	`next=${reportedNext} total=${reportedRealPrompt + (reportedNext ?? 0)}`,
+);
+
+// Same guarantee across window sizes: a tokenizer that counts 6% more tokens
+// than the estimate (the observed bias) must still fit after the clamp.
+{
+	let ok = true;
+	let detail = "";
+	for (const ctx of [8_192, 32_768, 98_304, 200_000]) {
+		for (const chars of [10_000, 100_000, 200_000, 240_000]) {
+			const payload = { messages: [{ role: "user", content: "x".repeat(chars) }], max_tokens: 32_768 };
+			const est = estimatePromptTokens(payload);
+			const next = clampMaxTokensToFit(payload, ctx) ?? 32_768;
+			const realPrompt = Math.ceil(est * 1.06);
+			if (realPrompt + 1 > ctx) continue; // prompt alone already overflows
+			if (realPrompt + next > ctx) {
+				ok = false;
+				detail = `ctx=${ctx} chars=${chars} est=${est} next=${next} real=${realPrompt}`;
+			}
+		}
+	}
+	check("a 6% denser tokenizer still fits after the clamp (all windows)", ok, detail);
+}
 
 // Never increases, even with ample room.
 check(
@@ -128,6 +190,117 @@ check(
 	"non-positive contextWindow → undefined",
 	clampMaxTokensToFit({ ...baseMessages, max_tokens: 1000 }, 0) === undefined,
 );
+
+// ── summarization (compaction checkpoints) ────────────────────────────────
+// pi sizes a summary with `model.maxTokens`, which for servers that announce no
+// limit is llama-infra's generation policy (32768 by default). A cumulative
+// summary that needs more was cut mid-sentence and pi rejected the checkpoint
+// ("generation hit the token cap and the summary is incomplete"), so the
+// summarization request is allowed to grow into the room the window has.
+
+const summarizationSystem = { role: "system", content: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER}. Your task is to read a conversation ...` };
+const normalSystem = { role: "system", content: "You are pi, a coding agent." };
+const transcript = (chars: number) => ({ role: "user", content: [{ type: "text", text: `<conversation>${"x".repeat(chars)}</conversation>` }] });
+
+check(
+	"detects pi's summarization request (system prompt + single transcript message, no tools)",
+	isSummarizationPayload({ messages: [summarizationSystem, transcript(1000)] }),
+);
+check(
+	"a normal turn is not a summarization request",
+	!isSummarizationPayload({ messages: [normalSystem, transcript(1000)] }),
+);
+check(
+	"a tool-carrying request is never treated as summarization",
+	!isSummarizationPayload({ messages: [summarizationSystem, transcript(1000)], tools: [{ type: "function" }] }),
+);
+check(
+	"the user mentioning summarization does not make a request a checkpoint",
+	!isSummarizationPayload({
+		messages: [normalSystem, { role: "user", content: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER} — what does this do?` }],
+	}),
+);
+check(
+	"anthropic-style top-level `system` is detected too",
+	isSummarizationPayload({ system: `${SUMMARIZATION_SYSTEM_PROMPT_MARKER}.`, messages: [transcript(1000)] }),
+);
+
+// The real failure: 98304-token window, ~34k-token transcript, model cap 32768.
+{
+	const ctx = 98_304;
+	const payload = { messages: [summarizationSystem, transcript(120_000)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check(
+		"summarization: the checkpoint gets more room than the generation policy cap",
+		next !== undefined && next > 32_768,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"summarization: the raised cap still fits (est + next + reserve <= ctx)",
+		next !== undefined && est + next + requestReserveTokens(est) <= ctx,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"summarization: an identical request that already fits is left untouched (undefined)",
+		clampMaxTokensToFit({ ...payload, max_tokens: next }, ctx) === undefined,
+	);
+}
+{
+	// Same prompt as a normal turn -> the policy cap stays untouched.
+	const ctx = 98_304;
+	const payload = { messages: [normalSystem, transcript(120_000)], max_tokens: 32_768 };
+	check("normal turn with the same size keeps the policy cap", clampMaxTokensToFit(payload, ctx) === undefined);
+}
+{
+	// A transcript whose prompt is huge must shrink even for summarization
+	// (400 protection wins over generosity).
+	const ctx = 98_304;
+	const payload = { messages: [summarizationSystem, transcript(300_000)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check(
+		"summarization of an oversized transcript is still clamped to fit",
+		next !== undefined && next < 32_768 && est + next + requestReserveTokens(est) <= ctx,
+		`est=${est} next=${next}`,
+	);
+}
+{
+	// 2026-11 compaction incident: window 262144 and a transcript the estimator
+	// sizes at ~42800 tokens. The clamp used to grow the checkpoint to the last
+	// free token of the window (pi asked 215045 output tokens); vLLM then counted
+	// 47100 prompt tokens and answered 400. A summary must never ask for more
+	// output tokens than the transcript it summarizes.
+	const ctx = 262_144;
+	const payload = { messages: [summarizationSystem, transcript(148_963)], max_tokens: 32_768 };
+	const est = estimatePromptTokens(payload);
+	const next = clampMaxTokensToFit(payload, ctx);
+	check("incident: the transcript estimates ~42800 tokens", Math.abs(est - 42_817) <= 60, `est=${est}`);
+	check(
+		"incident: the checkpoint output never exceeds the transcript estimate",
+		next !== undefined && next <= est,
+		`next=${next} est=${est}`,
+	);
+	check(
+		"incident: the request keeps most of the window free",
+		est + (next ?? 0) + requestReserveTokens(est) <= ctx / 2,
+		`est=${est} next=${next}`,
+	);
+	check(
+		"incident: a second pass over the same payload is a no-op",
+		clampMaxTokensToFit({ ...payload, max_tokens: next }, ctx) === undefined,
+	);
+}
+{
+	// The ceiling never goes below pi's generation policy, and a short transcript
+	// is not raised into the window just because the room is there.
+	const ctx = 262_144;
+	const payload = { messages: [summarizationSystem, transcript(4_000)], max_tokens: 32_768 };
+	check("a short transcript keeps the generation policy cap", clampMaxTokensToFit(payload, ctx) === undefined);
+	check("ceiling: policy is always allowed", summarizationOutputCeiling(32_768, 100) === 32_768);
+	check("ceiling: a bigger transcript allows more", summarizationOutputCeiling(32_768, 42_817) === 42_817);
+	check("ceiling: invalid values fall back to the policy/1", summarizationOutputCeiling(0, Number.NaN) === 1);
+}
 
 // ── composeOnPayload ──────────────────────────────────────────────────────
 // pi-ai calls onPayload with the final request body (tool schemas included),
@@ -150,8 +323,8 @@ void (async () => {
 			String(out.max_tokens),
 		);
 		check(
-			"composeOnPayload: clamped result satisfies est + next + safety <= ctx",
-			est + out.max_tokens + REQUEST_SAFETY_TOKENS <= clampCtx,
+			"composeOnPayload: clamped result satisfies est + next + reserve <= ctx",
+			est + out.max_tokens + requestReserveTokens(est) <= clampCtx,
 			`est=${est} next=${out.max_tokens}`,
 		);
 	}

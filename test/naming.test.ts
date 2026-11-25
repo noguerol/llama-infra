@@ -20,17 +20,17 @@ console.log("naming: what a model id becomes in /model");
 // ── flavor words survive ──────────────────────────────────────────────────
 check(
 	"uncensored fine-tune keeps its flavor",
-	cleanModelName("orcarouter/Qwen3.8-Flash-Next-Uncensored"),
-	"Qwen3.8-Flash-Next-Uncensored",
+	cleanModelName("orcarouter/Example-Flash-Next-Uncensored"),
+	"Example-Flash-Next-Uncensored",
 );
 check(
 	"the base model keeps its own name",
-	cleanModelName("Qwen3.8 Flash Next"),
-	"Qwen3.8 Flash Next",
+	cleanModelName("Example Flash Next"),
+	"Example Flash Next",
 );
 check(
 	"the two register under different names",
-	cleanModelName("orcarouter/Qwen3.8-Flash-Next-Uncensored") === cleanModelName("Qwen3.8 Flash Next")
+	cleanModelName("orcarouter/Example-Flash-Next-Uncensored") === cleanModelName("Example Flash Next")
 		? "IDENTICAL"
 		: "distinct",
 	"distinct",
@@ -51,8 +51,8 @@ check("q8_0 suffix is stripped", cleanModelName("Some-Model-Q8_0.gguf"), "Some-M
 // ── the (host:port) tag is preserved through cleaning ─────────────────────
 check(
 	"a tagged id keeps its tag",
-	cleanModelName("Qwen3.8-Flash-Next-Uncensored-Q4_K_M (gpu-host:8080)"),
-	"Qwen3.8-Flash-Next-Uncensored (gpu-host:8080)",
+	cleanModelName("Example-Flash-Next-Uncensored-Q4_K_M (gpu-host:8080)"),
+	"Example-Flash-Next-Uncensored (gpu-host:8080)",
 );
 check(
 	"a path prefix with a tag still cleans",

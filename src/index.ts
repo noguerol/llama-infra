@@ -21,10 +21,18 @@ import {
 	resolveThinkingBudgetField,
 	saveConfig,
 	setActiveConfig,
+	serverBaseUrl,
 	shared,
+	stripThinkingBudgetFields,
+	thinkingBudgetFieldDisabled,
 	THINKING_BUDGET_FIELD,
 } from "./core.ts";
-import { clampMaxTokensToFit, createLongTimeoutOpenAICompletionsStream, estimatePromptTokens } from "./runtime.ts";
+import {
+	clampMaxTokensToFit,
+	createLongTimeoutOpenAICompletionsStream,
+	estimatePromptTokens,
+	requestReserveTokens,
+} from "./runtime.ts";
 import {
 	detectVanishedModel,
 	endpointTags,
@@ -275,7 +283,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		pi.registerProvider(PROVIDER_NAME, {
 			name: "🦙 llama-infra (scanning…)",
-			baseUrl: `http://${first?.host ?? "127.0.0.1"}:${first?.ports[0] ?? 8080}/v1`,
+			baseUrl: first ? serverBaseUrl(first, first.ports[0] ?? 8080) : "http://127.0.0.1:8080/v1",
 			apiKey: first?.apiKey || "no-auth",
 			api: "openai-completions",
 			streamSimple: createLongTimeoutOpenAICompletionsStream,
@@ -567,7 +575,7 @@ export default function (pi: ExtensionAPI) {
 		const next = clampMaxTokensToFit(payload, model.contextWindow);
 		if (next === undefined) return undefined;
 		debugLog(
-			`max_tokens clamp ${payload.max_tokens} → ${next} (prompt ~${est} tok, ctx ${model.contextWindow})`,
+			`max_tokens ${(payload.max_tokens as number) > next ? "clamp" : "raise (summarization)"} ${payload.max_tokens} → ${next} (prompt ~${est} tok, reserve ${requestReserveTokens(est)}, ctx ${model.contextWindow})`,
 		);
 		return { ...payload, max_tokens: next };
 	});
@@ -668,7 +676,17 @@ export default function (pi: ExtensionAPI) {
 		const baseUrl = shared.modelBaseUrls.get(compactKey);
 		const kind = shared.endpointKinds.get(baseUrl ?? "");
 		const field = resolveThinkingBudgetField(compactKey, kind as never);
-		if (!field) return undefined;
+		if (!field) {
+			// Explicit opt-out (`thinkingBudgetField: false`): servers with a strict
+			// native worker answer HTTP 400 to unknown fields, so make sure a
+			// budget field from any client never reaches them.
+			if (thinkingBudgetFieldDisabled(compactKey)) {
+				const stripped = stripThinkingBudgetFields(payload);
+				if (stripped) debugLog(`thinking budget fields stripped for ${compactKey} (field disabled)`);
+				return stripped;
+			}
+			return undefined;
+		}
 
 		// 1) Rename llama.cpp's field onto the engine's field when needed.
 		let next = renameThinkingBudgetField(payload, field);

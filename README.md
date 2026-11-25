@@ -26,11 +26,12 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 ## Features
 
 - **Multi-machine discovery** — configurable list of servers (host, ports, API key, options); probes all of them at startup and on demand
+- **HTTPS servers** — per-server `protocol` (http/https) for machines proxied behind TLS (Tailscale serve, Caddy, …); discovery, metrics, warmup and chat requests all follow the configured scheme. Only public CA-issued certificates are supported — self-signed certificates are not supported
 - **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llama-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
 - **Per-model metadata badges** — 👁️ vision (mmproj / modalities), 🚀 drafter (speculative decoding), 🗜️ quant tag from GGUF filename, 🧠 KV cache quantization (from server args or `/proc`)
-- **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡) and generation (🔥) token speed, measured straight from the stream (per token, ~10 updates/s); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
+- **Live speed & metrics** — a constantly updating footer reading of the active model's prefill (⚡, or its time-to-first-token when the prompt is too short/cached to measure a throughput) and generation (🔥) token speed, measured straight from the stream (~10 updates/s, same accounting as trimegisto's `↑prefill ↓decode`); when pi is idle it also mirrors other clients the server's `/metrics` endpoint reports. Lives in the footer's status line, so no extra terminal row is taken. Works even without `--metrics`
 - **Energy cost (💰)** — local models report no per-token cost, so llama-infra estimates the **electricity** the inference consumed: configure each machine's power draw (kW) and tariff (per kWh) once, and every assistant message carries a realistic `usage.cost.total` (kW × €/kWh × measured request time) — pi's native cost footer, session stats and any consumer reading usage (e.g. trimegisto agents) all show it. Currency selector: USD / EUR / GBP / CNY
 - **Thinking budgets** — llama.cpp accepts `thinking_budget_tokens` per request; configure budgets per thinking level (minimal/low/medium/high/xhigh/max) per model; models with budgets are registered with reasoning enabled. llama.cpp-family models are registered with the `qwen-chat-template` thinking format, so pi also sends `chat_template_kwargs.enable_thinking` and the **off** level actually stops reasoning (required for halogen, which defaults to `xhigh`)
 - **Header warmup** — pre-caches the system prompt KV on llama.cpp-family servers so the first real request is faster
@@ -111,6 +112,21 @@ curl -s http://127.0.0.1:8081/v1/models | jq -r '.data[0] | "\(.id) owned_by=\(.
 
 **Thinking budgets** — vLLM's Qwen chat template exposes `chat_template_kwargs.enable_thinking` (verified: `false` → 0 reasoning tokens, `true` → reasoning is produced). The budget field is vLLM's own **`thinking_token_budget`** — not llama.cpp's `thinking_budget_tokens` — and it caps reasoning tokens while thinking is on (verified: `64` → 63, `128` → 127; `512` had no effect because the model stopped on its own). Configure per-level budgets under `modelOptions` as usual; for vLLM models the extension injects `thinking_token_budget`. Because vLLM **silently ignores** llama.cpp's `thinking_budget_tokens`, llama-infra also **renames** that field to the engine's field on the way out (so pi's native level budget works even when the server kind is not detected). If detection fails entirely (renamed wrapper, remote SGLang/TGI), force the field per model with `modelOptions[id].thinkingBudgetField: "thinking_token_budget"`. `preserve_thinking`, `reasoning_budget_tokens` and `chat_template_kwargs.reasoning_effort` are accepted but ignored by this server.
 
+**Servers that reject the field** — some OpenAI-compatible engines validate request fields strictly instead of ignoring unknown ones: a vLLM fork served by a custom *native worker* answers HTTP 400 `not supported by the … native worker: thinking_token_budget`. Two things happen then:
+
+- **Self-healing (automatic)** — when a turn fails with that error before producing any content (pi-ai emits `start` first, so llama-infra buffers until the error or the first real content event), or with a bare `400 status code (no body)` while a budget field was actually sent, llama-infra retries the request **once** without any budget field. If the retry succeeds it remembers the opt-out — `modelOptions[id].thinkingBudgetField: false` is written to the config, so neither the current session nor later scans ever send the field again. If the retry fails too (an unrelated 400, e.g. context overflow) the original error is surfaced untouched and nothing is persisted.
+- **Manual opt-out** — set `"thinkingBudgetField": false` per model (or type `none` / `off` in **🧠 Thinking budgets → 🔤 Budget field**). llama-infra then registers the model with `compat.thinkingTokenBudgetField: false` (pi's documented "do not send it" value), stops renaming into the field and strips any leftover `thinking_budget_tokens` / `thinking_token_budget` from the outgoing payload.
+
+```json
+{
+  "modelOptions": {
+    "Example-Model (gpu-host:8081)": { "thinkingBudgetField": false }
+  }
+}
+```
+
+Thinking levels and `chat_template_kwargs` keep working; only the token budget is not sent.
+
 **Metrics** — Prometheus names are normalized from the `vllm:` namespace (just like `llamacpp:`), so the footer ⚡/🔥 and `▶n` (other clients) readings work unchanged. Generation rate is read from `vllm:generation_tokens_total`.
 
 **Local vision detection & manual overrides** — vLLM publishes neither vision modality nor drafter/spec-decode info over HTTP. For **local engines** (loopback host, with `detectVision` enabled) llama-infra now reads the engine's own process args from `/proc` and uses them as ground truth for vision:
@@ -154,10 +170,12 @@ The resolver accepts both forms (raw id, registered display id, and the legacy `
 - `cacheK`/`cacheV` KV-quant badges stay empty (GGUF/llama.cpp-specific).
 - No `/slots`, so server-side idle stats come from `vllm:num_requests_running`, plus the spec-decode acceptance ratio (`🎯`) and prefix-cache hit ratio (`♻️`) derived from the `vllm:` counters.
 - vLLM serves one model per process; the server `mode` stays `single`.
-- The server enforces a hard limit and returns HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`; a correct `contextWindow` keeps pi's compaction predictable. When only one model needs a lower generation cap, set `modelOptions[id].maxTokens` (see [Per-model output cap](#per-model-output-cap-maxtokens)) instead of lowering the global `settings.maxOutputTokens`.
+- The server enforces a hard limit and returns HTTP 400 when prompt + `max_tokens` exceeds `max_model_len`; a correct `contextWindow` keeps pi's compaction predictable. Since no client-side estimate is tokenizer-exact for tool-heavy prompts, the provider stream also self-heals that 400 by retrying with the `max_tokens` the server's own prompt count allows (see [Tools-aware request clamp + overflow self-healing](#tools-aware-request-clamp--overflow-self-healing)). When only one model needs a lower generation cap, set `modelOptions[id].maxTokens` (see [Per-model output cap](#per-model-output-cap-maxtokens)) instead of lowering the global `settings.maxOutputTokens`.
 - This particular server does not validate types (e.g. `enable_thinking: "false"` is accepted); pi always sends proper booleans.
 
-**Tools-aware request clamp** — llama-infra now recomputes `max_tokens` on every provider request in a `before_provider_request` hook. It estimates the full payload — messages plus tool schemas, counting images at a fixed cost and skipping base64 data — and reserves `4096` tokens, so pi's tools-blind `estimateContextTokens()` can no longer let a tools-heavy request overflow the served context. The per-model `modelOptions[id].maxTokens` remains the **ceiling**: this clamp only lowers `max_tokens` when the estimated prompt requires the headroom, and never raises it above the configured cap. **Limitation:** nested calls made through `ctx.modelRegistry.streamSimple()` bypass `before_provider_request`, so the clamp applies to normal turns only.
+**Tools-aware request clamp + overflow self-healing** — llama-infra recomputes `max_tokens` on every provider request: in a `before_provider_request` hook for normal turns, and in an `onPayload` wrapper for nested `ctx.modelRegistry.streamSimple()` calls (which bypass the plugin hook). It estimates the full payload — messages plus tool schemas, counting images at a fixed cost and skipping base64 data — using conservative divisors (`chars/3.5` for text, `chars/3` for tool JSON; pi's own `estimateContextTokens()` uses `chars/3.5` and is blind to tool schemas) and reserves headroom of `max(4096, 10% of the estimate)`: a flat reserve is eaten whole by the estimator's own bias on a long tool-heavy prompt (measured: 71221 estimated vs 75318 counted by the server, +5.8%), leaving `prompt + max_tokens = context + 1` — the exact 400 the clamp exists to prevent. The headroom therefore grows with the prompt it is protecting. The per-model `modelOptions[id].maxTokens` remains the **ceiling** for normal turns: the clamp only lowers `max_tokens` when the estimated prompt requires the headroom, and never raises it above the configured cap. **Compaction checkpoints are the exception.** pi sizes a summary with `model.maxTokens`, and for servers that announce no limit of their own that is llama-infra's generation policy (`settings.maxOutputTokens`, 32768 by default). A cumulative summary grows past that policy, gets cut mid-sentence, and pi discards the partial checkpoint — `Summarization failed: generation hit the token cap and the summary is incomplete` — leaving the session unable to compact. Summarization requests (recognised by pi's own summarization system prompt, no tool schemas) are therefore sized to the room the window actually has, which may be *above* the configured cap, still under the same `prompt + max_tokens + reserve <= contextWindow` rule — and bounded by a **checkpoint ceiling**: a summary is a distillation of the transcript it summarizes, so the request never asks for more output tokens than the estimated transcript (`summarizationOutputCeiling()` in `src/runtime.ts`). Without that ceiling a checkpoint grows to the last free token of the window: on a 262144-token window that was 215045 output tokens, which left only 47100 for a prompt the estimator had under-counted at ~42800, and vLLM answered 400.
+
+No heuristic is exact, so when a strict engine still answers HTTP 400 (`This model's maximum context length is 200000 tokens … your prompt contains at least 167233 input tokens`), the provider stream parses the prompt size the server counted, buffers the failed turn (a 400 produces no content), and retries with `max_tokens = contextWindow - reported prompt - reserve`. That count is a **lower bound** — vLLM says *at least* N input tokens — so treating it as exact was how a retry could overflow again; the retry keeps a quarter of the remaining room free (`OVERFLOW_LOWER_BOUND_SHARE`) and may repeat up to `OVERFLOW_MAX_RETRIES` times, each attempt reading the newer report with a larger reserve, so the request converges instead of surfacing the 400 after one try. A prompt that already exceeds the window on its own is not retried at all (shrinking the answer cannot help). Errors that are not context overflows are never retried.
 
 **Ready-to-paste `~/.pi/agent/llama-infra.json`**
 
@@ -195,10 +213,15 @@ Per-level thinking budget for the registered vLLM model (injected as `thinking_t
     "my-hidden-vllm": {
       "thinkingBudgetField": "thinking_token_budget",
       "thinkingBudgets": { "minimal": 256, "low": 1024, "medium": 4096, "high": 16384 }
+    },
+    "strict-worker-vllm-fork": {
+      "thinkingBudgetField": false
     }
   }
 }
 ```
+
+`"thinkingBudgetField": false` disables the field entirely (servers that reject unknown request fields, e.g. a vLLM fork with a strict native worker). The same opt-out can be typed as `none`/`off` in the **🔤 Budget field** prompt, and llama-infra writes it on its own when such a server rejects a request.
 
 ## halogen
 
@@ -309,11 +332,11 @@ gufo models are registered with pi's `qwen-chat-template` thinking format, so pi
 
 The main config menu branches into submenus:
 
-- **🖥️ Servers** — add/remove/edit servers; per-server settings (host, ports, API key, probeDs4, label)
+- **🖥️ Servers** — add/remove/edit servers; per-server settings (host, protocol http/https, ports, API key, probeDs4, label)
 - **🔄 Scan** — rescan all servers now
 - **📋 Models** — per-model options (thinking budgets, replace/remove)
 - **🧪 Test** — connectivity test of all configured servers
-- **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM) and per-level token budgets
+- **🧠 Thinking budgets** — configure the per-model budget field (auto per engine, e.g. `thinking_token_budget` on vLLM, or `none`/`off` to send none on servers that reject it) and per-level token budgets
 - **📈 Metrics** — enable/disable footer metrics, server poll interval
 - **⚙️ Settings** — opens a native settings panel (the same UI as pi's own `/settings`): one row per option with its current value, a help line under the list explaining the highlighted option, Enter/Space to change, fuzzy search, Esc to go back. Covers discovery timeout, poll interval/budget, background rescan, startup grace, fail limit, vision detection, prefix model IDs, name badges, unloaded router models, max output tokens, request timeout, header warmup
 - **♻️ Reset settings** — restore all discovery settings to their defaults
@@ -388,7 +411,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
       "ports": [8080, 8081],
       "enabled": true,
       "probeDs4": true,
-      "apiKey": "optional-bearer-token"
+      "apiKey": "optional-bearer-token",
+      "protocol": "https"
     }
   ],
   "settings": {
@@ -431,6 +455,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `enabled` | `true` | Whether to probe this server |
 | `probeDs4` | `false` | Opt-in: ping `/v1/chat/completions` for DwarfStar/ds4 servers |
 | `apiKey` | — | Optional bearer token sent on discovery and per-model requests |
+| `protocol` | `http` | URL scheme for this machine: `http` or `https` (servers proxied behind TLS). Only public CA-issued certificates are supported — self-signed certificates are not supported |
 | `costProfile` | — | `{ kW, ratePerKwh }` energy-cost profile for this machine; enables 💰 estimation (see [Energy Cost](#energy-cost-)) |
 
 ### Settings
@@ -458,6 +483,8 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 ### Thinking budgets
 
 llama.cpp accepts `thinking_budget_tokens` per request; vLLM instead accepts `thinking_token_budget` (the extension picks the right field per server kind, and renames a llama.cpp-shaped field to the engine field so vLLM does not silently drop it). Configure budgets per thinking level per model through the config menu (`🧠 Thinking budgets` → select model → set level), where **🔤 Budget field** overrides the field name for models whose server kind cannot be detected (leave it on `auto (per engine)` normally). Models with any budget configured are registered with `reasoning: true`, and pi sends the budget automatically when the thinking level matches.
+
+**🔤 Budget field** also accepts `none` / `off` (config: `"thinkingBudgetField": false`): the server then receives **no** budget field at all. Use it on engines that reject unknown request fields — a strict vLLM fork with a custom native worker answers HTTP 400 `not supported by the … native worker: thinking_token_budget`. llama-infra also detects that error on its own: it retries the request once without the field and, only if the retry succeeds, saves the opt-out for that model.
 
 Levels: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`.
 
@@ -511,6 +538,7 @@ When enabled, the speed reading appears in the footer's status line (no extra te
 🦙(12) ⚡… 🔥…       (before the first measurement)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (while streaming)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (just after the answer ends — last rates kept)
+🦙(12) ⚡ 561ms   🔥 38.1 t/s  (short/cached prompt: TTFT instead of a fake rate)
 🦙(12) ⚡ 420 t/s 🔥 38.1 t/s  (between turns — last rates persisted)
 🦙(12) ▶2 ⚡ 150 t/s 🔥 18.0 t/s  (pi idle, server busy for other clients)
 🦙(12) ⏸ 💰3.2c      (no rate measured yet; energy cost of this session)
@@ -520,7 +548,12 @@ When enabled, the speed reading appears in the footer's status line (no extra te
 
 The footer is **persistent**: llama-infra keeps the last measured prefill/generation rates on the status line instead of clearing them between requests or turns, so the footer stays stable during multi-step agent runs; it only shows the `⚡…`/`🔥…` placeholders before the first measurement and the idle `⏸` when no rate has ever been measured and the server is idle.
 
-- **Client measurement (always, no `--metrics` needed)** — prefill speed = `prompt tokens ÷ (request → first token)` (pi's `usage.input`, OpenAI-style `prompt_tokens` as fallback); generation speed = a moving 1.5 s window over per-token arrival samples. Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
+- **Client measurement (always, no `--metrics` needed)** — both numbers are whole-request averages, the same model trimegisto uses for `↑prefill ↓decode`:
+
+  - **⚡ prefill** = *uncached* prompt tokens (`usage.input + usage.cacheWrite`, i.e. what the engine really processed) ÷ time-to-first-token. That division is only reported as a throughput when the sample is big enough for compute to dominate (**TTFT ≥ 1 s and ≥ 500 prompt tokens**); otherwise — a small prompt, or an engine answering from its **prefix cache** in ~0.5 s while still reporting the full `prompt_tokens` — the footer shows the TTFT itself (`⚡ 561ms`). Without that guard a cached 80k-token prompt reports six figures (real case: `142489 t/s`). The rate is smoothed with an EMA (α = 0.35).
+  - **🔥 generation** = generated tokens ÷ time since the first token. Stream chunks are *not* tokens (one chunk can carry many tokens, and a tool-call fragment is a JSON slice), so live samples use the streamed characters converted with a tokens-per-character ratio learned from the provider's real `usage.output` (default 0.35 tok/char, calibrated after each request); the finished request always uses the authoritative token count. Samples shorter than 400 ms are ignored.
+
+  Updated ~every 100 ms while a stream is live (throttled, and unchanged text is skipped, so the footer never churns).
 - **Server supplement (only when pi is idle)** — the poller fetches the server's Prometheus `/metrics` endpoint (or JSON `/stats`) every `metricsPollMs` (default 5 s). If the server reports other clients processing, their ⚡/🔥 rates are shown (`▶n`); when the server is idle the last measured client rates stay on the line, and the plain `⏸` reading is only used when no rate has ever been measured.
 
 ## Energy Cost (💰)
@@ -597,10 +630,21 @@ Subsystems:
 
 - **Discovery engine** — multi-server probing with timeouts, retry budgets, and per-server kind detection (llama.cpp, gufo, ZINC, DwarfStar, lucebox, LM Studio, vLLM, halogen)
 - **Router support** — single-model and multi-model llama.cpp modes with per-model status, args parsing and metadata extraction
-- **Speed & metrics subsystem** — client-side per-token speed measurement (prefill + moving-window generation), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
+- **Speed & metrics subsystem** — client-side speed measurement (uncached-prefill throughput or TTFT + whole-request generation rate, with a learned chars→tokens ratio), throttled footer status updates, and server `/metrics` polling that supplements the footer while the client is idle
 - **Thinking budgets** — per-model per-level configuration with automatic `reasoning` registration
 - **Config persistence** — `~/.pi/agent/llama-infra.json` with one-time migration from `local-models.json`
 - **/proc scanner** — local llama-server process detection for vision, KV cache quant, and drafter flags
+
+## Development
+
+```bash
+# every behavior test is a standalone script (node built-ins only, no install)
+for f in test/*.test.ts; do node --experimental-strip-types "$f" || break; done
+```
+
+The artwork (`docs/banner.jpeg`, `docs/preview.jpeg`) is generated, not screenshotted: `python3 docs/generate-artwork.py` redraws both with system fonts (Pillow, offline, deterministic), so the copy — and the labels — can be reviewed in the diff instead of hiding inside a binary.
+
+`test/no-private-data.test.ts` guards this PUBLIC repo (and runs in CI before any publish): it fails when a tracked file carries an absolute home path, a Tailscale hostname, an API key, a personal e-mail — or anything listed in `sanitize-denylist.local.json`, an optional **git-ignored** file where you list the hostnames and model names of your own machines (`{ "forbid": ["myhost", "Example-27B-Private"] }`). Keep fleet names there, never in the tree: the repo is public, so the guard's own denylist must stay local.
 
 ## Migration from local-models
 

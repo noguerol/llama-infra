@@ -29,6 +29,9 @@ export interface ServerConfig {
 	enabled: boolean;
 	probeDs4?: boolean;
 	apiKey?: string;
+	/** URL scheme used to probe and request this machine (default: "http").
+	 *  "https" for servers proxied behind TLS (e.g. Tailscale serve, Caddy). */
+	protocol?: "http" | "https";
 	/** Energy-cost profile for this machine (kW + tariff). */
 	costProfile?: CostProfile;
 }
@@ -46,8 +49,12 @@ export interface ModelOptions {
 	thinkingBudgets?: ThinkingBudgets;
 	/** Override the top-level request field that carries the thinking budget for
 	 *  THIS model (e.g. `"thinking_token_budget"` on vLLM when the server kind is
-	 *  not detected). Wins over the per-kind default; see core.thinkingBudgetField. */
-	thinkingBudgetField?: string;
+	 *  not detected). Wins over the per-kind default; see core.thinkingBudgetField.
+	 *  Set it to `false` to send **no** budget field at all: some engines (strict
+	 *  Python workers, vLLM forks with a custom native worker) answer HTTP 400
+	 *  "not supported …": the field must then never be sent. llama-infra also
+	 *  sets this to `false` on its own when a server rejects the field. */
+	thinkingBudgetField?: string | false;
 	/** Manual override to force vision detection (vLLM does not publish modalities in /v1/models). */
 	vision?: boolean;
 	/** Informative drafter/spec-decode label (vLLM does not publish it). */
@@ -295,7 +302,12 @@ export interface CompatProfile {
 	maxTokensField: "max_tokens";
 	supportsUsageInStreaming: boolean;
 	supportsStrictMode: boolean;
-	thinkingTokenBudgetField?: string;
+	/** Top-level thinking-budget request field, or `false` when the server must
+	 *  not receive one at all (pi treats a falsy value as "disabled"). */
+	thinkingTokenBudgetField?: string | false;
+	/** Set to `false` alongside `thinkingTokenBudgetField: false` so pi's own
+	 *  alias (`supportsThinkingTokenBudget` → vLLM field) cannot re-enable it. */
+	supportsThinkingTokenBudget?: boolean;
 	/** pi's per-engine thinking control. `qwen-chat-template` makes pi send
 	 *  `chat_template_kwargs:{enable_thinking,preserve_thinking}` — what halogen
 	 *  (and llama.cpp Qwen templates) read to turn thinking off/on. */

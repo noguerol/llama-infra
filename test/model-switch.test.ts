@@ -55,15 +55,15 @@ check(
 
 // ── 2) query resolution ────────────────────────────────────────────────────
 const models: PiModel[] = [
-	model("Qwen3.8-Flash-Next-Uncensored (127.0.0.1:8080)", { serverModelId: "orcarouter/Qwen3.8-Flash-Next-Uncensored" }),
-	model("Qwen3.8-Flash-Next (192.168.1.9:8080)", { serverModelId: "Qwen3.8 Flash Next" }),
+	model("Example-Flash-Next-Uncensored (127.0.0.1:8080)", { serverModelId: "orcarouter/Example-Flash-Next-Uncensored" }),
+	model("Example-Flash-Next (192.168.1.9:8080)", { serverModelId: "Example Flash Next" }),
 	model("DeepSeek-R1 (127.0.0.1:8080)", { serverModelId: "deepseek-r1.gguf" }),
 ];
 
 check("exact registered id wins", pickModel(models, models[0].id).matches[0]?.id === models[0].id);
 check(
 	"raw server id resolves the model",
-	pickModel(models, "orcarouter/Qwen3.8-Flash-Next-Uncensored").matches[0]?.id === models[0].id,
+	pickModel(models, "orcarouter/Example-Flash-Next-Uncensored").matches[0]?.id === models[0].id,
 );
 check(
 	"separator-insensitive fragment resolves one model",
@@ -91,8 +91,8 @@ check(
 );
 
 // ── 3) adopting the model that replaced ours ───────────────────────────────
-const onGufo = model("Qwen3.8-Flash-Next-Uncensored (127.0.0.1:8080)");
-const swapped = model("Qwen3.8 Flash Next (127.0.0.1:8080)", { serverModelId: "Qwen3.8 Flash Next" });
+const onGufo = model("Example-Flash-Next-Uncensored (127.0.0.1:8080)");
+const swapped = model("Example Flash Next (127.0.0.1:8080)", { serverModelId: "Example Flash Next" });
 const otherHost = model("Other (192.168.1.9:8080)");
 
 const van = detectVanishedModel([onGufo], [swapped], onGufo.id);
@@ -138,7 +138,7 @@ check(
 );
 check(
 	"a different model on the same endpoint is not recovered",
-	resolveStaleServerModelId("Qwen3.8-Flash-Next (127.0.0.1:8080)", new Map([["Qwen3.8-Flash-Next-Uncensored (127.0.0.1:8080)", "orcarouter/uncensored"]])) === undefined,
+	resolveStaleServerModelId("Example-Flash-Next (127.0.0.1:8080)", new Map([["Example-Flash-Next-Uncensored (127.0.0.1:8080)", "orcarouter/uncensored"]])) === undefined,
 );
 
 // ── 5) end to end: the swapped-in model is pickable by name ───────────────
@@ -164,7 +164,7 @@ const scan: ScanResult = {
 			latencyMs: 2,
 			models: [
 				{
-					id: "orcarouter/Qwen3.8-Flash-Next-Uncensored",
+					id: "orcarouter/Example-Flash-Next-Uncensored",
 					owned_by: "gufo",
 					context_length: 262144,
 					architecture: { input_modalities: ["text", "image"] },
@@ -183,7 +183,7 @@ check(
 );
 check(
 	"the raw served id is preserved for the request payload",
-	registered[0]?.serverModelId === "orcarouter/Qwen3.8-Flash-Next-Uncensored",
+	registered[0]?.serverModelId === "orcarouter/Example-Flash-Next-Uncensored",
 	registered[0]?.serverModelId,
 );
 check(
@@ -193,7 +193,7 @@ check(
 );
 check(
 	"the two models are now distinguishable by name",
-	registered[0]?.id !== "Qwen3.8-Flash-Next (127.0.0.1:8080)",
+	registered[0]?.id !== "Example-Flash-Next (127.0.0.1:8080)",
 	registered[0]?.id,
 );
 
