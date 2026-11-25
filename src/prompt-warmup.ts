@@ -6,11 +6,18 @@
 // PI_WARMUP_TIMEOUT_MS, PI_WARMUP_COOLDOWN_MS, PI_WARMUP_DEBUG=1.
 
 import * as http from "node:http";
-import * as https from "node:https";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { homedir } from "node:os";
 import { URL } from "node:url";
+import { tlsInsecureForUrl } from "./core.ts";
+import {
+	REQUEST_FAMILY,
+	requestClient,
+	requestHostname,
+	requestPort,
+	tlsRequestOptions,
+} from "./net.ts";
 
 const KIND_LLAMACPP = "llamacpp";
 const KIND_LUCEBOX = "lucebox";
@@ -172,11 +179,13 @@ function warmupRequest(
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		const url = new URL(normalizeBaseUrl(baseUrl) + "/chat/completions");
-		const isHttps = url.protocol === "https:";
-		const mod = isHttps ? https : http;
+		// Same transport rules as the scanner: https when the model is published
+		// behind a TLS proxy, dual-stack DNS so IPv6-only hosts warm up too, and
+		// the per-server certificate opt-in.
+		const client = requestClient(url);
 		const options: http.RequestOptions = {
-			hostname: url.hostname,
-			port: url.port || (isHttps ? 443 : 80),
+			hostname: requestHostname(url),
+			port: requestPort(url),
 			path: url.pathname + url.search,
 			method: "POST",
 			headers: {
@@ -186,11 +195,12 @@ function warmupRequest(
 				Connection: "close",
 			},
 			timeout: timeoutMs,
-			family: 4,
+			family: REQUEST_FAMILY,
+			...tlsRequestOptions(tlsInsecureForUrl(url)),
 			agent: false,
 		};
 
-		const req = mod.request(options, (res) => {
+		const req = (client.request as typeof http.request)(options, (res) => {
 			const chunks: Buffer[] = [];
 			res.on("data", (c: Buffer) => chunks.push(c));
 			res.on("end", () => {

@@ -26,7 +26,9 @@ Anything else (Ollama, cloud APIs…) is out of scope — use pi's built-in prov
 ## Features
 
 - **Multi-machine discovery** — configurable list of servers (host, ports, API key, options); probes all of them at startup and on demand
-- **HTTPS servers** — per-server `protocol` (http/https) for machines proxied behind TLS (Tailscale serve, Caddy, …); discovery, metrics, warmup and chat requests all follow the configured scheme. Only public CA-issued certificates are supported — self-signed certificates are not supported
+- **HTTPS servers** — per-server `protocol` (http/https) for machines proxied behind TLS (Tailscale serve, Caddy, …); discovery, metrics, warmup and chat requests all follow the configured scheme. Certificates are verified by default; a self-signed or private-CA host can opt out per server (`tlsInsecure: true`, only offered for servers you control)
+- **IPv4 *and* IPv6** — outgoing requests are dual-stack (IPv6-only hosts and IPv6 tailnet addresses work), and an IPv6 literal in `host` is bracketed automatically (`fd00::1` → `http://[fd00::1]:8080/v1`)
+- **A working model at startup** — `autoSelectModel` (default on) moves the session off an offline llama-infra model onto the highest-priority server that is **online** (`priority`, `0` = the default), through the same `pi.setModel()` path as `/llama-infra use`. Models of other providers are never touched, and an online selection is respected
 - **Compact model ids** — models appear as `Name (host:port)` in pi's `/model` picker, like a native provider; the raw GGUF path/alias is sent to the server automatically on every request
 - **Single-model & router modes** — llama.cpp single-model mode (one GGUF per instance) and router mode (multiple models per server, with per-model status and args)
 - **Long local generations** — discovered models are registered with up to **32,768 output tokens** (bounded by the model/server context) and llama-infra OpenAI-compatible requests enforce a **20 minute** timeout floor so slow local runs don't get cut early by pi defaults
@@ -412,7 +414,9 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
       "enabled": true,
       "probeDs4": true,
       "apiKey": "optional-bearer-token",
-      "protocol": "https"
+      "protocol": "https",
+      "tlsInsecure": true,
+      "priority": 0
     }
   ],
   "settings": {
@@ -455,7 +459,9 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `enabled` | `true` | Whether to probe this server |
 | `probeDs4` | `false` | Opt-in: ping `/v1/chat/completions` for DwarfStar/ds4 servers |
 | `apiKey` | — | Optional bearer token sent on discovery and per-model requests |
-| `protocol` | `http` | URL scheme for this machine: `http` or `https` (servers proxied behind TLS). Only public CA-issued certificates are supported — self-signed certificates are not supported |
+| `protocol` | `http` | URL scheme for this machine: `http` or `https` (servers proxied behind TLS) |
+| `tlsInsecure` | `false` | Accept an unverifiable certificate (self-signed / private CA) from this host. Only applies with `protocol: "https"`; verification stays on otherwise |
+| `priority` | `100` | Preference order among online servers when `autoSelectModel` picks one: lower wins, `0` = the default; equal values keep the config order |
 | `costProfile` | — | `{ kW, ratePerKwh }` energy-cost profile for this machine; enables 💰 estimation (see [Energy Cost](#energy-cost-)) |
 
 ### Settings
@@ -466,6 +472,7 @@ Everything is configurable through the UI, but the persisted file is `~/.pi/agen
 | `pollIntervalMs` | `4000` | Background re-poll rate while servers load models |
 | `pollMaxMs` | `90000` | Max total polling time |
 | `rescanIntervalMs` | `30000` | Background re-scan of every enabled endpoint, so a model swapped on a running server is picked up without a manual scan; `0` turns it off |
+| `autoSelectModel` | `true` | At session start, switch to the highest-priority **online** server when the current llama-infra model is offline; other providers are never touched |
 | `startupGraceMs` | `40000` | Keep trying at startup while nothing has answered |
 | `knownGoodFailLimit` | `3` | Consecutive failures before a live endpoint is dropped |
 | `detectVision` | `true` | Scan `/proc` for `--mmproj` + read server-reported modalities |

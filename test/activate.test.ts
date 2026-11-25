@@ -232,6 +232,25 @@ check(
 	JSON.stringify(setModelCalls),
 );
 
+// ── 8) a session that starts on an offline model moves to a live one ───────
+// Issue #1: pi restores its configured default model, which may name a server
+// that is down; nothing in the UI points at the online alternative. The
+// extension switches (same pi.setModel path as `use`) and says why.
+setModelCalls.length = 0;
+notifications.length = 0;
+const offlineId = `Retired Model ${tag}`;
+await fire("session_start", { type: "session_start" }, mkCtx(offlineId));
+check(
+	"an offline session model is switched to an online one",
+	await waitFor(() => setModelCalls.includes(idC), 4000),
+	JSON.stringify({ calls: setModelCalls, models: shared.lastModels.map((m: any) => m.id) }),
+);
+check(
+	"the switch explains itself",
+	notifications.some((n) => n.includes("is offline") && n.includes("preferred server")),
+	JSON.stringify(notifications.slice(-3)),
+);
+
 server.close();
 if (failures > 0) {
 	console.error(`activate tests failed: ${failures}`);

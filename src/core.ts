@@ -6,12 +6,15 @@ import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type {
 	CompatProfile,
+	EndpointResult,
 	InfraConfig,
 	ModelOptions,
+	PiModel,
 	ServerConfig,
 	ServerKind,
 	SettingsConfig,
 } from "./types.ts";
+import { authorityHost } from "./net.ts";
 
 // ── Provider identity ───────────────────────────────────────────────────────
 export const PROVIDER_NAME = "llama-infra";
@@ -29,6 +32,8 @@ export const THINKING_BUDGET_FIELD = "thinking_budget_tokens";
 export const VLLM_THINKING_BUDGET_FIELD = "thinking_token_budget";
 export const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 20 * 60 * 1000;
+/** Preference order for a server that does not set `priority`. */
+export const DEFAULT_SERVER_PRIORITY = 100;
 
 // ── Settings defaults ───────────────────────────────────────────────────────
 export const DEFAULT_SETTINGS: SettingsConfig = {
@@ -49,6 +54,7 @@ export const DEFAULT_SETTINGS: SettingsConfig = {
 	showBadgesInNames: true,
 	currency: "eur",
 	costTracking: true,
+	autoSelectModel: true,
 };
 
 export const DEFAULT_SERVERS: ServerConfig[] = [
@@ -121,6 +127,12 @@ export function normalizeServer(s: Record<string, unknown>): import("./types.ts"
 		...(s.probeDs4 === true ? { probeDs4: true } : {}),
 		...(typeof s.apiKey === "string" && s.apiKey ? { apiKey: s.apiKey } : {}),
 		...(s.protocol === "https" ? { protocol: "https" as const } : s.protocol === "http" ? { protocol: "http" as const } : {}),
+		// Only meaningful for a TLS server, and opt-in: never persisted otherwise.
+		...(s.protocol === "https" && s.tlsInsecure === true ? { tlsInsecure: true } : {}),
+		...(() => {
+			const p = typeof s.priority === "number" ? s.priority : parseFloat(String(s.priority ?? ""));
+			return Number.isFinite(p) ? { priority: p } : {};
+		})(),
 		...(() => {
 			const p = parseCostProfile(s.costProfile);
 			return p ? { costProfile: p } : {};
@@ -576,7 +588,8 @@ export function serverLabel(srv: ServerConfig): string {
 
 /** Base URL for one endpoint of a server, honoring its protocol (default http). */
 export function serverBaseUrl(srv: Pick<ServerConfig, "host" | "protocol">, port: number): string {
-	return `${srv.protocol === "https" ? "https" : "http"}://${srv.host}:${port}/v1`;
+	// IPv6 literals need brackets inside a URL authority: http://[fd00::1]:8080/v1
+	return `${srv.protocol === "https" ? "https" : "http"}://${authorityHost(srv.host)}:${port}/v1`;
 }
 
 export function idSafeHost(host: string): string {
@@ -592,4 +605,70 @@ export function baseName(p: string): string {
 	const cleaned = p.replace(/\\/g, "/");
 	const last = cleaned.split("/").pop() || cleaned;
 	return last;
+}
+// ── Server transport (http/https) helpers ──────────────────────────────────
+/** Preference order for a server: lower wins, `0` is "the default". */
+export function serverPriority(srv: Pick<ServerConfig, "priority">): number {
+	const p = srv.priority;
+	return typeof p === "number" && Number.isFinite(p) ? p : DEFAULT_SERVER_PRIORITY;
+}
+
+/** Tolerance for a self-signed certificate, matched by hostname: the scanner
+ *  and the warmup client only know the URL, not which server entry it came
+ *  from, so the (host → policy) lookup happens here. */
+export function tlsInsecureForUrl(url: URL): boolean {
+	const config = shared.activeConfig;
+	if (!config) return false;
+	const host = url.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+	return config.servers.some((s) => s.tlsInsecure === true && s.host.trim().toLowerCase() === host);
+}
+
+/**
+ * The model pi should fall back to when the current one is unreachable.
+ *
+ * Servers are ranked by `priority` (lower first, unset = 100, config order
+ * breaks ties); the first enabled server with a successful scan that actually
+ * exposes models wins, and its first registered model is returned. Returns
+ * undefined when no configured server is online.
+ */
+export function choosePreferredModel(
+	models: PiModel[],
+	servers: ServerConfig[],
+	endpoints: EndpointResult[],
+): PiModel | undefined {
+	const online = new Set(
+		endpoints.filter((e) => e.ok && (e.models?.length ?? 0) > 0).map((e) => e.serverId),
+	);
+	const ranked = servers
+		.map((srv, index) => ({ srv, index, priority: serverPriority(srv) }))
+		.filter(({ srv }) => srv.enabled && online.has(srv.id))
+		.sort((a, b) => a.priority - b.priority || a.index - b.index);
+	for (const { srv } of ranked) {
+		const model = models.find((m) => m.endpoint?.serverId === srv.id);
+		if (model) return model;
+	}
+	return undefined;
+}
+
+/**
+ * Decide whether the session should move off its current model.
+ *
+ * Only ever acts on `provider`: a model of any other provider is the user's
+ * business and is returned untouched (undefined). No switch happens when the
+ * current model is online, or when no online server exposes a model.
+ */
+export function preferredModelOverride(
+	current: { id?: string; provider?: string } | undefined,
+	models: PiModel[],
+	servers: ServerConfig[],
+	endpoints: EndpointResult[],
+	provider: string,
+): PiModel | undefined {
+	if (!current?.id || current.provider !== provider) return undefined;
+	const onlineServers = new Set(endpoints.filter((e) => e.ok && (e.models?.length ?? 0) > 0).map((e) => e.serverId));
+	const onlineIds = new Set(models.filter((m) => onlineServers.has(m.endpoint?.serverId)).map((m) => m.id));
+	if (onlineIds.has(current.id)) return undefined;
+	const target = choosePreferredModel(models, servers, endpoints);
+	if (!target || target.id === current.id) return undefined;
+	return target;
 }

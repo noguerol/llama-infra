@@ -19,6 +19,7 @@ import {
 	rawIdFor,
 	renameThinkingBudgetField,
 	resolveThinkingBudgetField,
+	preferredModelOverride,
 	saveConfig,
 	setActiveConfig,
 	serverBaseUrl,
@@ -273,6 +274,33 @@ export default function (pi: ExtensionAPI) {
 		await activateModel(pick.matches[0], ctx);
 	}
 
+	/**
+	 * Start the session on a reachable model (issue #1).
+	 *
+	 * pi picks its model from settings, which can name a server that is offline
+	 * right now, and nothing in the UI makes the alternative obvious. When the
+	 * active model is one of OURS and it is not online, switch to the
+	 * highest-priority online server (`ServerConfig.priority`, `0` = the default)
+	 * through the same `pi.setModel()` path as `/llama-infra use`. A model from
+	 * another provider is never touched, and an online selection is respected.
+	 */
+	async function selectPreferredModel(ctx: ExtensionContext): Promise<void> {
+		if (!config.settings.autoSelectModel) return;
+		const target = preferredModelOverride(
+			ctx.model,
+			shared.lastModels,
+			config.servers,
+			shared.lastScan?.endpoints ?? [],
+			PROVIDER_NAME,
+		);
+		if (!target) return;
+		const from = (ctx.model as { id?: string } | undefined)?.id ?? "current model";
+		debugLog(`current model is offline; switching to preferred "${target.id}"`);
+		const switched = await activateModel(target, ctx);
+		if (!switched) return;
+		notify(`🦙 "${from}" is offline — switched to the preferred server`);
+	}
+
 	// ── Empty provider registration (pi boots without waiting) ───────────
 	function registerEmptyProvider() {
 		const first = config.servers.find((s) => s.enabled && s.ports.length > 0);
@@ -283,7 +311,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		pi.registerProvider(PROVIDER_NAME, {
 			name: "🦙 llama-infra (scanning…)",
-			baseUrl: first ? serverBaseUrl(first, first.ports[0] ?? 8080) : "http://127.0.0.1:8080/v1",
+			baseUrl: serverBaseUrl(first ?? { host: "127.0.0.1" }, first?.ports[0] ?? 8080),
 			apiKey: first?.apiKey || "no-auth",
 			api: "openai-completions",
 			streamSimple: createLongTimeoutOpenAICompletionsStream,
@@ -874,11 +902,12 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!ctxHasUI(ctx)) return;
 		void discoverAndRegister()
-			.then((r) => {
+			.then(async (r) => {
 				if (!extensionActive) return;
 				schedulePolling(r.shouldPoll);
 				startDiscoveryInterval();
 				updateStatusFooter(ctx);
+				await selectPreferredModel(ctx);
 			})
 			.catch((err) => {
 				if (!extensionActive) return;

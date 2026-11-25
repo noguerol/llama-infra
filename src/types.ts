@@ -32,6 +32,14 @@ export interface ServerConfig {
 	/** URL scheme used to probe and request this machine (default: "http").
 	 *  "https" for servers proxied behind TLS (e.g. Tailscale serve, Caddy). */
 	protocol?: "http" | "https";
+	/** Accept an unverifiable TLS certificate (self-signed / private CA). Only
+	 *  applies with `protocol: "https"`; keep it off for hosts you do not own. */
+	tlsInsecure?: boolean;
+	/** Preference order among the servers that are online, lower first
+	 *  (`0` = the default). Absent = `DEFAULT_SERVER_PRIORITY`; equal values
+	 *  keep the order of the configuration file. Used to pick the model pi
+	 *  starts on when the current one is not reachable. */
+	priority?: number;
 	/** Energy-cost profile for this machine (kW + tariff). */
 	costProfile?: CostProfile;
 }
@@ -88,6 +96,11 @@ export interface SettingsConfig {
 	currency: Currency;
 	/** Whether the footer shows accumulated energy cost (default: true). */
 	costTracking: boolean;
+	/** At session start, switch to a reachable model when the active one is a
+	 *  llama-infra model whose server is offline (default: true). The target is
+	 *  the highest-priority online server (see `ServerConfig.priority`); models
+	 *  from other providers are never touched. */
+	autoSelectModel: boolean;
 }
 
 export interface InfraConfig {

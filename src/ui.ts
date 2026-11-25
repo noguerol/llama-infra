@@ -5,6 +5,7 @@ import { Container, SettingsList, type SettingItem, Text } from "@earendil-works
 
 import {
 	clearModelMaxTokens,
+	DEFAULT_SERVER_PRIORITY,
 	DEFAULT_SETTINGS,
 	getConfigPath,
 	idSafeHost,
@@ -12,6 +13,7 @@ import {
 	parseThinkingBudgetFieldOption,
 	saveConfig,
 	serverLabel,
+	serverPriority,
 	serversShareEndpoint,
 	shared,
 } from "./core.ts";
@@ -257,6 +259,7 @@ const SETTING_LABELS: Record<string, string> = {
 	pollIntervalMs: "Poll interval",
 	pollMaxMs: "Poll budget",
 	rescanIntervalMs: "Background rescan",
+	autoSelectModel: "Auto-select model",
 	startupGraceMs: "Startup grace",
 	knownGoodFailLimit: "Known-good fail limit",
 	detectVision: "Vision detection",
@@ -444,7 +447,7 @@ async function showServersMenu(ctx: ExtensionContext, deps: UiDeps): Promise<voi
 			items.push({
 				value: srv.id,
 				label: `${state} ${serverLabel(srv)}`,
-				description: `${srv.protocol === "https" ? "https://" : "http://"}${srv.host} · ${srv.ports.length} port(s)${srv.enabled ? ` · ${models} model(s)` : " · disabled"}`,
+				description: `${srv.protocol === "https" ? "https://" : "http://"}${srv.host} · ${srv.ports.length} port(s)${srv.enabled ? ` · ${models} model(s)` : " · disabled"}${serverPriority(srv) === DEFAULT_SERVER_PRIORITY ? "" : ` · ⭐${serverPriority(srv)}`}`,
 			});
 		}
 		items.push({ value: "__add", label: "➕ Add server", description: "register a new machine" });
@@ -471,6 +474,20 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 				value: "protocol",
 				label: `🔒 Protocol: ${srv.protocol === "https" ? "https" : "http"}`,
 				description: srv.protocol === "https" ? "TLS (server proxied behind HTTPS)" : "plaintext HTTP",
+			},
+			...(srv.protocol === "https"
+				? [
+						{
+							value: "tls",
+							label: `🛡️ TLS verify: ${srv.tlsInsecure ? "OFF (self-signed accepted)" : "ON"}`,
+							description: "accept a self-signed / private-CA certificate from this host",
+						},
+					]
+				: []),
+			{
+				value: "priority",
+				label: `⭐ Priority: ${serverPriority(srv)}${serverPriority(srv) === 0 ? " (default)" : ""}`,
+				description: "lower wins when pi picks a model at startup; 0 = this machine first",
 			},
 			{ value: "label", label: "🏷️ Change label", description: `currently: ${serverLabel(srv)}` },
 			{ value: "ports", label: "🔌 Edit ports", description: `currently: ${srv.ports.join(", ")}` },
@@ -526,9 +543,42 @@ async function showServerMenu(ctx: ExtensionContext, srv: ServerConfig, deps: Ui
 			}
 			case "protocol": {
 				srv.protocol = srv.protocol === "https" ? "http" : "https";
+				// The certificate opt-in only exists for TLS; dropping it on plain
+				// HTTP keeps the config honest (and it is re-asked when re-enabling).
+				if (srv.protocol === "http") delete srv.tlsInsecure;
 				saveConfig(config);
 				ctx.ui.notify(`🔒 ${serverLabel(srv)} now uses ${srv.protocol}`, "info");
 				await deps.rescan(ctx);
+				break;
+			}
+			case "tls": {
+				srv.tlsInsecure = srv.tlsInsecure !== true;
+				saveConfig(config);
+				ctx.ui.notify(
+					srv.tlsInsecure
+						? `🛡️ ${serverLabel(srv)}: self-signed certificate accepted (verification OFF)`
+						: `🛡️ ${serverLabel(srv)}: certificate verification ON`,
+					srv.tlsInsecure ? "warning" : "info",
+				);
+				await deps.rescan(ctx);
+				break;
+			}
+			case "priority": {
+				const raw = await ctx.ui.input(
+					"⭐ Priority (lower wins, 0 = default)",
+					String(serverPriority(srv)),
+				);
+				if (raw === undefined) break;
+				const trimmed = raw.trim();
+				const parsed = trimmed === "" ? DEFAULT_SERVER_PRIORITY : Number(trimmed);
+				if (!Number.isFinite(parsed)) {
+					ctx.ui.notify("❌ Priority must be a number", "error");
+					break;
+				}
+				if (parsed === DEFAULT_SERVER_PRIORITY) delete srv.priority;
+				else srv.priority = parsed;
+				saveConfig(config);
+				ctx.ui.notify(`⭐ ${serverLabel(srv)} priority = ${serverPriority(srv)}`, "info");
 				break;
 			}
 			case "label": {
@@ -667,6 +717,14 @@ async function addServerFlow(ctx: ExtensionContext, deps: UiDeps): Promise<void>
 		"🔒 HTTPS?",
 		"Is this machine proxied behind TLS (https://)? Leave off for plain HTTP.",
 	);
+	// A local reverse proxy is usually self-signed: without this the server would
+	// only ever show up as 🔴 with an opaque TLS error.
+	const selfSigned = useHttps
+		? await ctx.ui.confirm(
+				"🛡️ Self-signed certificate?",
+				"Accept an unverifiable certificate from this host? Only for machines you control.",
+			)
+		: false;
 
 	let id = idSafeHost(trimmedHost).replace(/[^a-z0-9.-]/g, "-");
 	let n = 2;
@@ -680,6 +738,7 @@ async function addServerFlow(ctx: ExtensionContext, deps: UiDeps): Promise<void>
 		enabled: true,
 		probeDs4,
 		...(useHttps ? { protocol: "https" as const } : {}),
+		...(useHttps && selfSigned ? { tlsInsecure: true } : {}),
 	});
 	saveConfig(config);
 	ctx.ui.notify(`➕ Server added: ${label.trim() || trimmedHost} (${trimmedHost}) — ports ${ports.join(", ")}`, "info");
@@ -1079,6 +1138,14 @@ async function showSettingsMenu(ctx: ExtensionContext, deps: UiDeps): Promise<vo
 			values: [0, 15_000, 30_000, 60_000, 300_000, 900_000].map((v) => (v === 0 ? "off" : formatMs(v))),
 		},
 		{
+			id: "autoSelectModel",
+			label: "Auto-select model",
+			description:
+				"At session start, switch to the highest-priority ONLINE server when the current llama-infra model is offline. Other providers are never touched.",
+			currentValue: onOff(s.autoSelectModel),
+			values: ON_OFF,
+		},
+		{
 			id: "startupGraceMs",
 			label: "Startup grace",
 			description: "Extra patience at pi startup while no server has answered yet, so slow machines still get discovered.",
@@ -1166,6 +1233,7 @@ const durationOpts: Record<string, number[]> = {
 					case "prefixModelIds":
 					case "showBadgesInNames":
 					case "includeUnloadedRouterModels":
+					case "autoSelectModel":
 					case "warmup":
 						st[id] = value === "true";
 						break;

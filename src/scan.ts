@@ -5,7 +5,8 @@
 import * as http from "node:http";
 import * as https from "node:https";
 import { readFileSync, readdirSync } from "node:fs";
-import { baseName, isLocalHost, modelOptionsFor, serverBaseUrl, serverLabel, shared } from "./core.ts";
+import { baseName, isLocalHost, modelOptionsFor, serverBaseUrl, serverLabel, shared, tlsInsecureForUrl } from "./core.ts";
+import { REQUEST_FAMILY, requestHostname, requestPort, tlsRequestOptions } from "./net.ts";
 import type {
 	EndpointResult,
 	HttpResult,
@@ -181,13 +182,18 @@ function httpRequest(
 			headers["Content-Length"] = Buffer.byteLength(body).toString();
 		}
 		const options: http.RequestOptions = {
-			hostname: parsed.hostname,
-			port: parsed.port || (isHttps ? 443 : 80),
+			// IPv6 literals lose their URL brackets here; the port defaults by scheme.
+			hostname: requestHostname(parsed),
+			port: requestPort(parsed),
 			path: parsed.pathname + parsed.search,
 			method,
 			headers,
 			timeout: timeoutMs,
-			family: 4,
+			// Dual-stack DNS: IPv6-only hosts (and IPv6 tailnet addresses) used to
+			// fail with getaddrinfo ENOTFOUND while this was pinned to family 4.
+			family: REQUEST_FAMILY,
+			// Self-signed certificates are accepted only for servers that opted in.
+			...tlsRequestOptions(tlsInsecureForUrl(parsed)),
 			agent: new (isHttps ? https.Agent : http.Agent)({ keepAlive: false, maxSockets: 1 }),
 		};
 
